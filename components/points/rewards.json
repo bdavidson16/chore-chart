@@ -1,0 +1,42 @@
+{
+    "points": {
+        "daily": {
+            "title": "Daily Points",
+            "description": "Points earned for completing daily chores."
+        },
+        "weekly": {
+            "title": "Weekly Points",
+            "description": "Points earned for completing weekly chores."
+        },
+        "monthly": {
+            "title": "Monthly Points",
+            "description": "Points earned for completing monthly chores."
+        }
+    },
+    "user_rewards": {
+        "bronze": {
+            "title": "Bronze Reward",
+            "description": "Earned for completing 10 chores."
+        },
+        "silver": {
+            "title": "Silver Reward",
+            "description": "Earned for completing 25 chores."
+        },
+        "gold": {
+            "title": "Gold Reward",
+            "description": "Earned for completing 50 chores."
+        }
+    },
+    "user_points_totals": {
+        "Jim": {
+            "daily": 0,
+            "weekly": 0,
+            "monthly": 0
+        },
+        "Bailey": {
+            "daily": 0,
+            "weekly": 0,
+            "monthly": 0
+        }
+    }
+}

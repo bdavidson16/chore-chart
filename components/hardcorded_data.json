@@ -1,0 +1,47 @@
+{
+    "users": [
+        {
+            "id": 1,
+            "name": "Bailey",
+            "email": "baileydavidson16@gmail.com"
+        },
+        {
+            "id": 2,
+            "name": "Jim",
+            "email": "jdb01t@outlook.com"
+        }
+    ],
+    "chores": [
+        {
+            "id": 1,
+            "name": "Vacuum",
+            "description": "Use the vacuum cleaner to clean the living room carpet and floors.",
+            "frequency": "daily"
+        },
+        {
+            "id": 2,
+            "name": "Dishes",
+            "description": "Clean all the dishes in the sink and put them away.",
+            "frequency": "daily"
+        },
+        {
+            "id": 3,
+            "name": "Trash",
+            "description": "Collect all trash from the house and take it to the curb for pickup.",
+            "frequency": "weekly"
+        },
+        {
+            "id": 4,
+            "name": "Laundry",
+            "description": "Wash, dry, and fold all laundry.",
+            "frequency": "weekly"
+        },
+        {
+            "id": 5,
+            "name": "Clean Bathroom",
+            "description": "Scrub the toilet, sink, and shower/tub. Clean the mirror and mop the floor.",
+            "frequency": "monthly"
+        }       
+    ]
+}
+
