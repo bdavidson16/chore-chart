@@ -27,3 +27,4 @@ venv/
 *.njsproj
 *.sln
 *.sw?
+ts/

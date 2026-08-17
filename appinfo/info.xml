@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
+    <id>choretracker</id>
+    <name>Chore Chart</name>
+    <summary>Shared chore list with due dates, a calendar and a points system</summary>
+    <description><![CDATA[
+Assign chores to people, track them on a calendar, and award points when they
+are done. Points scale with the chore's frequency and how long it had been
+since it was last completed, and reward tiers unlock as chores add up.
+    ]]></description>
+    <version>0.1.0</version>
+    <licence>agpl</licence>
+    <author>Bailey Davidson</author>
+    <namespace>ChoreTracker</namespace>
+    <category>organization</category>
+    <bugs>https://github.com/bdavidson16/chore-chart/issues</bugs>
+    <dependencies>
+        <nextcloud min-version="28" max-version="31"/>
+    </dependencies>
+    <navigations>
+        <navigation>
+            <name>Chore Chart</name>
+            <route>choretracker.page.index</route>
+        </navigation>
+    </navigations>
+</info>

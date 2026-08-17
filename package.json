@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "api": "php -S 127.0.0.1:8000 -t . api/index.php",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview"
