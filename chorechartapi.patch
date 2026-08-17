@@ -1,0 +1,4718 @@
+From e39286950e2595326ad4f6e093a7f1d1157e5353 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 17 Aug 2026 00:52:07 +0000
+Subject: [PATCH] Back the React app with a PHP + SQLite API built from
+ components/
+
+The React app kept its state in localStorage with its own hardcoded seed data,
+so it shared nothing with the components/ sketches, hardcorded_data.json or the
+SQLite database. Give it a real backend instead.
+
+The PHP is laid out the way a Nextcloud app is (appinfo/, lib/Controller,
+lib/Db, templates/) so the move to Nextcloud does not mean rewriting it:
+
+  - lib/Db/Database.php     schema plus an additive import of
+                            hardcorded_data.json and rewards.json
+  - lib/Db/*Mapper.php      users, chores, assignments, notifications, tiers
+  - lib/Service            PointsService (PointHelpers.jsx) and Schedule,
+                            which derives due dates and priority from frequency
+  - lib/Controller         chores, assignments, users, notifications
+  - appinfo/routes.php     the route table, in Nextcloud's format
+  - api/index.php          local front controller that dispatches that table
+
+The frontend gains the pieces it never had: per-user point bars with the
+add/remove animations, the notification bell, reward tiers, the '+' assign
+action, and a details panel. Filters and sorting now run server-side against
+the same query the Python port used.
+
+Points work as PointHelpers.jsx documents: base points for the frequency times
+days since the chore was last done, capped at 30 days, written to a ledger row
+per assignment so reopening a chore takes back exactly what it gave.
+
+Also fills in the empty appinfo/info.xml and Nextcloud stubs, drops the empty
+lib/Db/Chore.php and the superseded api/ChoreList.jsx, and scopes oxlint to app
+source so the components/ sketches stop failing the lint run.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Ecf5N6QrrbFgByW2grjdy3
+---
+ .gitignore                                |   1 +
+ .oxlintrc.json                            |   1 +
+ README.md                                 |  90 ++-
+ api/ChoreList.jsx                         |  48 --
+ api/index.php                             |  94 +++
+ appinfo/info.xml                          |  27 +
+ appinfo/routes.php                        |  38 +
+ lib/Controller/AssignmentController.php   | 133 ++++
+ lib/Controller/BadRequest.php             |  11 +
+ lib/Controller/ChoreController.php        | 138 +++-
+ lib/Controller/HttpException.php          |  19 +
+ lib/Controller/NotFound.php               |  11 +
+ lib/Controller/NotificationController.php |  32 +
+ lib/Controller/PageController.php         |  30 +
+ lib/Controller/UserController.php         |  62 ++
+ lib/Db/AssignmentMapper.php               | 261 ++++++
+ lib/Db/Chore.php                          |   0
+ lib/Db/ChoreMapper.php                    |  83 ++
+ lib/Db/Database.php                       | 205 +++++
+ lib/Db/NotificationMapper.php             |  48 ++
+ lib/Db/RewardTierMapper.php               |  21 +
+ lib/Db/UserMapper.php                     |  95 +++
+ lib/Service/PointsService.php             |  89 +++
+ lib/Service/Schedule.php                  |  88 +++
+ lib/autoload.php                          |  15 +
+ package.json                              |   1 +
+ src/App.css                               | 504 ++++++++++--
+ src/App.tsx                               | 916 +++++++---------------
+ src/api.ts                                | 167 ++++
+ src/components/Calendar.tsx               | 220 ++++++
+ src/components/ChoreDetails.tsx           | 131 ++++
+ src/components/ChoreList.tsx              | 191 +++++
+ src/components/NotificationBell.tsx       |  60 ++
+ src/components/PointBar.tsx               |  79 ++
+ src/components/Settings.tsx               | 210 +++++
+ src/main.tsx                              |  15 +-
+ templates/main.php                        |   3 +-
+ vite.config.ts                            |  17 +-
+ 38 files changed, 3361 insertions(+), 793 deletions(-)
+ delete mode 100644 api/ChoreList.jsx
+ create mode 100644 api/index.php
+ create mode 100644 lib/Controller/AssignmentController.php
+ create mode 100644 lib/Controller/BadRequest.php
+ create mode 100644 lib/Controller/HttpException.php
+ create mode 100644 lib/Controller/NotFound.php
+ create mode 100644 lib/Controller/NotificationController.php
+ create mode 100644 lib/Controller/UserController.php
+ create mode 100644 lib/Db/AssignmentMapper.php
+ delete mode 100644 lib/Db/Chore.php
+ create mode 100644 lib/Db/Database.php
+ create mode 100644 lib/Db/NotificationMapper.php
+ create mode 100644 lib/Db/RewardTierMapper.php
+ create mode 100644 lib/Db/UserMapper.php
+ create mode 100644 lib/Service/PointsService.php
+ create mode 100644 lib/Service/Schedule.php
+ create mode 100644 lib/autoload.php
+ create mode 100644 src/api.ts
+ create mode 100644 src/components/Calendar.tsx
+ create mode 100644 src/components/ChoreDetails.tsx
+ create mode 100644 src/components/ChoreList.tsx
+ create mode 100644 src/components/NotificationBell.tsx
+ create mode 100644 src/components/PointBar.tsx
+ create mode 100644 src/components/Settings.tsx
+
+diff --git a/.gitignore b/.gitignore
+index 458df5a..ffaec6c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -27,3 +27,4 @@ venv/
+ *.njsproj
+ *.sln
+ *.sw?
++ts/
+diff --git a/.oxlintrc.json b/.oxlintrc.json
+index 6fa991d..0235cef 100644
+--- a/.oxlintrc.json
++++ b/.oxlintrc.json
+@@ -1,6 +1,7 @@
+ {
+   "$schema": "./node_modules/oxlint/configuration_schema.json",
+   "plugins": ["react", "typescript", "oxc"],
++  "ignorePatterns": ["components/**", "ts/**"],
+   "rules": {
+     "react/rules-of-hooks": "error",
+     "react/only-export-components": ["warn", { "allowConstantExport": true }]
+diff --git a/README.md b/README.md
+index d6af7e3..1918e7f 100644
+--- a/README.md
++++ b/README.md
+@@ -1,32 +1,78 @@
+-# React + TypeScript + Vite
++# Chore Chart
+ 
+-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
++Assign chores to people, track them on a calendar, and award points when they get
++done. Points scale with a chore's frequency and how long it had been since it was
++last completed.
+ 
+-Currently, two official plugins are available:
++The React frontend talks to a PHP + SQLite API. The PHP is laid out the way a
++Nextcloud app is (`appinfo/`, `lib/Controller`, `lib/Db`, `templates/`) so it can
++be dropped into Nextcloud without rewriting the backend.
+ 
+-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
+-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
++## Running it
+ 
+-## React Compiler
++Two processes: the API and the dev server.
+ 
+-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
++```bash
++npm install
++npm run api    # PHP API on http://127.0.0.1:8000
++npm run dev    # Vite on http://localhost:5173, proxying /api to the API
++```
++
++The database is created and seeded on the first request, so there is no separate
++migration step.
++
++## Where the data comes from
+ 
+-## Expanding the Oxlint configuration
++`components/hardcorded_data.json` (users and chores) and
++`components/points/rewards.json` (reward tiers) are imported into
++`chore_chart.db` the first time the API runs against an empty table. The import
++is additive and matches on name, so re-running it never duplicates or overwrites
++anything.
+ 
+-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
++## Layout
+ 
+-```json
+-{
+-  "$schema": "./node_modules/oxlint/configuration_schema.json",
+-  "plugins": ["react", "typescript", "oxc"],
+-  "options": {
+-    "typeAware": true
+-  },
+-  "rules": {
+-    "react/rules-of-hooks": "error",
+-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
+-  }
+-}
+ ```
++components/          the original JSX sketches, kept as the spec
++src/
++  api.ts             typed client for the API
++  App.tsx            shell: tabs, filters, data loading
++  components/        PointBar, NotificationBell, ChoreList, ChoreDetails,
++                     Calendar, Settings
++lib/
++  Db/                Database (schema + seed) and the mappers
++  Service/           PointsService (PointHelpers.jsx), Schedule (due dates)
++  Controller/        Chore, Assignment, User, Notification, Page
++appinfo/routes.php   route table, in the Nextcloud format
++api/index.php        local front controller that dispatches that table
++```
++
++Each `components/*.jsx` sketch maps onto real code:
++
++| Sketch | Backend | Frontend |
++| --- | --- | --- |
++| `chores/chore_list.jsx` | `AssignmentMapper`, `ChoreController::assign` | `components/ChoreList.tsx` |
++| `chores/chore_details.jsx` | `AssignmentMapper::find` | `components/ChoreDetails.tsx` |
++| `points/PointHelpers.jsx` | `Service/PointsService.php` | `components/PointBar.tsx` |
++| `users/notify_user.jsx` | `NotificationMapper` | `components/NotificationBell.tsx` |
++| `calendar/calendar.jsx` | `AssignmentMapper::findAll` filters | `components/Calendar.tsx` |
++
++## How points work
++
++Base points come from the frequency — daily 10, weekly 5, biweekly 3, monthly 2,
++one-time 1 — multiplied by the days since the chore was last completed, capped at
++30 days. Awards are written to a `points_ledger` row per assignment, so reopening
++a chore takes back exactly what it gave.
++
++## Nextcloud
++
++`npm run build` emits an IIFE bundle to `ts/`, which `templates/main.php` loads.
++`appinfo/routes.php` and the controllers are already in Nextcloud's shape; moving
++over means swapping `lib/Db/Database.php` for the server's `IDBConnection`,
++pointing `API_BASE` in `src/api.ts` at the app's route prefix, and dropping
++`api/index.php`, which only exists to serve the API in local development.
++
++## Streamlit app
+ 
+-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
++`app.py`, `chore_data.py`, `point_bar.py` and `views/` are an earlier Python port
++of the same sketches. They read the same `chore_chart.db` and still run
++(`streamlit run app.py`), but the React app above is the one being taken forward.
+diff --git a/api/ChoreList.jsx b/api/ChoreList.jsx
+deleted file mode 100644
+index 5b7d412..0000000
+--- a/api/ChoreList.jsx
++++ /dev/null
+@@ -1,48 +0,0 @@
+-import React, { useState, useEffect } from 'react';
+-
+-const ChoreList = () => {
+-  const [chores, setChores] = useState([]);
+-  const [loading, setLoading] = useState(true);
+-  const [error, setError] = useState(null);
+-
+-  useEffect(() => {
+-    const fetchChores = async () => {
+-      try {
+-        const response = await fetch('/apps/choretracker/api/chores'); // Endpoint
+-
+-        if (!response.ok) {
+-          throw new Error(`HTTP error! Status: ${response.status}`);
+-        }
+-
+-        const data = await response.json();
+-        setChores(data);
+-      } catch (error) {
+-        setError(error);
+-      } finally {
+-        setLoading(false);
+-      }
+-    };
+-
+-    fetchChores();
+-  }, []); // Empty dependency array ensures this runs only once on mount
+-
+-  if (loading) {
+-    return <div>Loading chores...</div>;
+-  }
+-
+-  if (error) {
+-    return <div>Error fetching chores: {error.message}</div>;
+-  }
+-
+-  return (
+-    <ul>
+-      {chores.map((chore) => (
+-        <li key={chore.id}>
+-          <strong>{chore.title}</strong> - Assigned to: {chore.assigned_to} - Due Date: {chore.due_date}
+-        </li>
+-      ))}
+-    </ul>
+-  );
+-};
+-
+-export default ChoreList;
+\ No newline at end of file
+diff --git a/api/index.php b/api/index.php
+new file mode 100644
+index 0000000..923b8b0
+--- /dev/null
++++ b/api/index.php
+@@ -0,0 +1,94 @@
++<?php
++
++/**
++ * Local JSON API front controller.
++ *
++ * Dispatches the routes declared in appinfo/routes.php against the controllers
++ * in lib/Controller. Under Nextcloud this file goes away — the server routes the
++ * same table to the same controllers.
++ *
++ * Run it with:  php -S localhost:8000 -t . api/index.php
++ */
++
++declare(strict_types=1);
++
++require_once dirname(__DIR__) . '/lib/autoload.php';
++
++use ChoreChart\Controller\HttpException;
++use ChoreChart\Db\Database;
++
++header('Content-Type: application/json');
++
++$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
++$path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
++
++if ($method === 'OPTIONS') {
++    http_response_code(204);
++    exit;
++}
++
++$controllers = [
++    'chore' => \ChoreChart\Controller\ChoreController::class,
++    'assignment' => \ChoreChart\Controller\AssignmentController::class,
++    'user' => \ChoreChart\Controller\UserController::class,
++    'notification' => \ChoreChart\Controller\NotificationController::class,
++];
++
++/** Turn '/api/chores/{id}/assign' into a regex that captures {id}. */
++function routePattern(string $url): string
++{
++    $quoted = preg_quote($url, '#');
++    $withParams = preg_replace('#\\\{(\w+)\\\}#', '(?P<$1>[^/]+)', $quoted);
++    return '#^' . $withParams . '/?$#';
++}
++
++try {
++    Database::migrate();
++    Database::seedIfEmpty();
++
++    $routes = require dirname(__DIR__) . '/appinfo/routes.php';
++
++    $match = null;
++    $pathParams = [];
++    foreach ($routes['routes'] as $route) {
++        if (strtoupper($route['verb']) !== $method) {
++            continue;
++        }
++        if (preg_match(routePattern($route['url']), $path, $captures) === 1) {
++            $match = $route;
++            $pathParams = array_filter($captures, 'is_string', ARRAY_FILTER_USE_KEY);
++            break;
++        }
++    }
++
++    if ($match === null) {
++        http_response_code(404);
++        echo json_encode(['error' => "No route for $method $path"]);
++        exit;
++    }
++
++    [$controllerKey, $action] = explode('#', $match['name']);
++    if (!isset($controllers[$controllerKey])) {
++        http_response_code(404);
++        echo json_encode(['error' => "No controller for {$match['name']}"]);
++        exit;
++    }
++
++    $body = [];
++    if (in_array($method, ['POST', 'PUT', 'PATCH'], true)) {
++        $raw = file_get_contents('php://input') ?: '';
++        $decoded = json_decode($raw, true);
++        $body = is_array($decoded) ? $decoded : [];
++    }
++
++    $params = array_merge($_GET, $body, $pathParams);
++    $payload = (new $controllers[$controllerKey]())->$action($params);
++
++    echo json_encode($payload);
++} catch (HttpException $e) {
++    http_response_code($e->status());
++    echo json_encode(['error' => $e->getMessage()]);
++} catch (Throwable $e) {
++    http_response_code(500);
++    echo json_encode(['error' => $e->getMessage()]);
++}
+diff --git a/appinfo/info.xml b/appinfo/info.xml
+index e69de29..ec73486 100644
+--- a/appinfo/info.xml
++++ b/appinfo/info.xml
+@@ -0,0 +1,27 @@
++<?xml version="1.0"?>
++<info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++      xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
++    <id>choretracker</id>
++    <name>Chore Chart</name>
++    <summary>Shared chore list with due dates, a calendar and a points system</summary>
++    <description><![CDATA[
++Assign chores to people, track them on a calendar, and award points when they
++are done. Points scale with the chore's frequency and how long it had been
++since it was last completed, and reward tiers unlock as chores add up.
++    ]]></description>
++    <version>0.1.0</version>
++    <licence>agpl</licence>
++    <author>Bailey Davidson</author>
++    <namespace>ChoreTracker</namespace>
++    <category>organization</category>
++    <bugs>https://github.com/bdavidson16/chore-chart/issues</bugs>
++    <dependencies>
++        <nextcloud min-version="28" max-version="31"/>
++    </dependencies>
++    <navigations>
++        <navigation>
++            <name>Chore Chart</name>
++            <route>choretracker.page.index</route>
++        </navigation>
++    </navigations>
++</info>
+diff --git a/appinfo/routes.php b/appinfo/routes.php
+index e69de29..f06e301 100644
+--- a/appinfo/routes.php
++++ b/appinfo/routes.php
+@@ -0,0 +1,38 @@
++<?php
++
++/**
++ * Routes, in the Nextcloud app format: each entry names a controller, a method
++ * and a URL. Locally api/index.php reads this array and dispatches; under
++ * Nextcloud the server's router reads the same file.
++ */
++
++return [
++    'routes' => [
++        ['name' => 'page#index', 'url' => '/', 'verb' => 'GET'],
++
++        ['name' => 'chore#index', 'url' => '/api/chores', 'verb' => 'GET'],
++        ['name' => 'chore#create', 'url' => '/api/chores', 'verb' => 'POST'],
++        ['name' => 'chore#show', 'url' => '/api/chores/{id}', 'verb' => 'GET'],
++        ['name' => 'chore#update', 'url' => '/api/chores/{id}', 'verb' => 'PUT'],
++        ['name' => 'chore#destroy', 'url' => '/api/chores/{id}', 'verb' => 'DELETE'],
++        ['name' => 'chore#assign', 'url' => '/api/chores/{id}/assign', 'verb' => 'POST'],
++
++        ['name' => 'assignment#index', 'url' => '/api/assignments', 'verb' => 'GET'],
++        ['name' => 'assignment#create', 'url' => '/api/assignments', 'verb' => 'POST'],
++        ['name' => 'assignment#show', 'url' => '/api/assignments/{id}', 'verb' => 'GET'],
++        ['name' => 'assignment#update', 'url' => '/api/assignments/{id}', 'verb' => 'PUT'],
++        ['name' => 'assignment#destroy', 'url' => '/api/assignments/{id}', 'verb' => 'DELETE'],
++        ['name' => 'assignment#complete', 'url' => '/api/assignments/{id}/complete', 'verb' => 'POST'],
++        ['name' => 'assignment#reopen', 'url' => '/api/assignments/{id}/reopen', 'verb' => 'POST'],
++        ['name' => 'assignment#addUpdate', 'url' => '/api/assignments/{id}/updates', 'verb' => 'POST'],
++
++        ['name' => 'user#index', 'url' => '/api/users', 'verb' => 'GET'],
++        ['name' => 'user#create', 'url' => '/api/users', 'verb' => 'POST'],
++        ['name' => 'user#progress', 'url' => '/api/users/progress', 'verb' => 'GET'],
++        ['name' => 'user#destroy', 'url' => '/api/users/{id}', 'verb' => 'DELETE'],
++        ['name' => 'user#points', 'url' => '/api/users/{id}/points', 'verb' => 'GET'],
++
++        ['name' => 'notification#index', 'url' => '/api/notifications', 'verb' => 'GET'],
++        ['name' => 'notification#markRead', 'url' => '/api/notifications/read', 'verb' => 'POST'],
++    ],
++];
+diff --git a/lib/Controller/AssignmentController.php b/lib/Controller/AssignmentController.php
+new file mode 100644
+index 0000000..cd3e1a0
+--- /dev/null
++++ b/lib/Controller/AssignmentController.php
+@@ -0,0 +1,133 @@
++<?php
++
++namespace ChoreChart\Controller;
++
++use ChoreChart\Db\AssignmentMapper;
++
++/**
++ * Assignments: the chore list itself, plus completion, which is where points are
++ * awarded (PointHelpers.handleChoreCompletion).
++ */
++class AssignmentController
++{
++    public function __construct(private AssignmentMapper $assignments = new AssignmentMapper())
++    {
++    }
++
++    /** GET /api/assignments?status=&userId=&query=&sortBy= */
++    public function index(array $params): array
++    {
++        return ['assignments' => $this->assignments->findAll([
++            'status' => (string)($params['status'] ?? 'All'),
++            'userId' => isset($params['userId']) ? (int)$params['userId'] : null,
++            'query' => (string)($params['query'] ?? ''),
++            'sortBy' => (string)($params['sortBy'] ?? 'Priority'),
++        ])];
++    }
++
++    /** GET /api/assignments/{id} — chore_details.jsx */
++    public function show(array $params): array
++    {
++        $assignment = $this->requireAssignment((int)$params['id']);
++        return [
++            'assignment' => $assignment,
++            'updates' => $this->assignments->updates($assignment['id']),
++        ];
++    }
++
++    /** POST /api/assignments */
++    public function create(array $params): array
++    {
++        $choreId = (int)($params['choreId'] ?? 0);
++        $userId = (int)($params['userId'] ?? 0);
++        if ($choreId === 0 || $userId === 0) {
++            throw new BadRequest('An assignment needs a chore and a user');
++        }
++
++        $dueDate = (string)($params['dueDate'] ?? '');
++        if ($dueDate === '') {
++            throw new BadRequest('An assignment needs a due date');
++        }
++
++        $assignment = $this->assignments->insert(
++            $choreId,
++            $userId,
++            $dueDate,
++            (string)($params['priority'] ?? 'Medium'),
++        );
++
++        if (isset($params['status']) && $params['status'] !== 'Pending') {
++            $assignment = $this->assignments->update($assignment['id'], ['status' => $params['status']]);
++        }
++
++        return ['assignment' => $assignment];
++    }
++
++    /** PUT /api/assignments/{id} */
++    public function update(array $params): array
++    {
++        $id = (int)$params['id'];
++        $this->requireAssignment($id);
++
++        $fields = array_intersect_key(
++            $params,
++            array_flip(['choreId', 'userId', 'dueDate', 'priority', 'status'])
++        );
++
++        // Going through Done via a plain edit still has to award points.
++        if (($fields['status'] ?? null) === 'Done') {
++            unset($fields['status']);
++            $this->assignments->update($id, $fields);
++            return ['assignment' => $this->assignments->complete($id)['assignment']];
++        }
++
++        return ['assignment' => $this->assignments->update($id, $fields)];
++    }
++
++    /** DELETE /api/assignments/{id} */
++    public function destroy(array $params): array
++    {
++        $this->assignments->delete((int)$params['id']);
++        return ['deleted' => true];
++    }
++
++    /** POST /api/assignments/{id}/complete */
++    public function complete(array $params): array
++    {
++        $id = (int)$params['id'];
++        $this->requireAssignment($id);
++        return $this->assignments->complete($id);
++    }
++
++    /** POST /api/assignments/{id}/reopen */
++    public function reopen(array $params): array
++    {
++        $id = (int)$params['id'];
++        $this->requireAssignment($id);
++        return $this->assignments->reopen($id);
++    }
++
++    /** POST /api/assignments/{id}/updates */
++    public function addUpdate(array $params): array
++    {
++        $id = (int)$params['id'];
++        $this->requireAssignment($id);
++
++        $text = trim((string)($params['text'] ?? ''));
++        if ($text === '') {
++            throw new BadRequest('An update needs some text');
++        }
++
++        $this->assignments->addUpdate($id, $text);
++        return ['updates' => $this->assignments->updates($id)];
++    }
++
++    private function requireAssignment(int $id): array
++    {
++        $assignment = $this->assignments->find($id);
++        if ($assignment === null) {
++            throw new NotFound('Assignment not found');
++        }
++        return $assignment;
++    }
++}
+diff --git a/lib/Controller/BadRequest.php b/lib/Controller/BadRequest.php
+new file mode 100644
+index 0000000..7ab8611
+--- /dev/null
++++ b/lib/Controller/BadRequest.php
+@@ -0,0 +1,11 @@
++<?php
++
++namespace ChoreChart\Controller;
++
++class BadRequest extends HttpException
++{
++    public function __construct(string $message = 'Bad request')
++    {
++        parent::__construct($message, 400);
++    }
++}
+diff --git a/lib/Controller/ChoreController.php b/lib/Controller/ChoreController.php
+index 20b6fc3..e72575b 100644
+--- a/lib/Controller/ChoreController.php
++++ b/lib/Controller/ChoreController.php
+@@ -1,24 +1,120 @@
+-public function create(\OC\App\Request\Simple as $request): ?string
+-{
+-    $file = \OC::$server->getRootFolder()->newFile('chores.md');
+-    $data = [
+-        'title' => $request->param('title'),
+-        'assigned_to' => $request->param('assigned_to'),
+-        'done' => false,
+-        'due_date' => $request->param('due_date'),
+-    ];
+-    $file->write(json_encode($data));
+-    return $file->getURL();
+-}
++<?php
++
++namespace ChoreChart\Controller;
++
++use ChoreChart\Db\AssignmentMapper;
++use ChoreChart\Db\ChoreMapper;
++use ChoreChart\Service\Schedule;
+ 
+-public function getChore(\OC\App\Request\Simple as $request): ?array
++/**
++ * Chores: the catalogue, plus the assign action behind the '+' in chore_list.jsx.
++ */
++class ChoreController
+ {
+-    $id = $request->param('id');
+-    $file = \OC::$server->getRootFolder()->newFile('chores.md');
+-    $content = $file->read();
+-    $chores = json_decode($content, true); // Decode as associative array
+-    if ($chores && isset($chores[$id])) {
+-        return $chores[$id];
++    public function __construct(
++        private ChoreMapper $chores = new ChoreMapper(),
++        private AssignmentMapper $assignments = new AssignmentMapper(),
++    ) {
++    }
++
++    /** GET /api/chores */
++    public function index(array $params): array
++    {
++        $chores = $this->chores->findAll();
++
++        // The '+' rows need a prefilled due date and the priority it implies.
++        foreach ($chores as &$chore) {
++            $scheduledDue = Schedule::nextDueDate($chore['frequency'], $chore['lastCompleted']);
++            [$state, $suggested] = Schedule::derive($scheduledDue, $chore['frequency']);
++            $chore['scheduledDue'] = $scheduledDue->format('Y-m-d');
++            $chore['dueState'] = $state;
++            $chore['suggestedPriority'] = $suggested;
++        }
++        unset($chore);
++
++        if (($params['unassigned'] ?? '') === '1') {
++            $chores = array_values(array_filter(
++                $chores,
++                static fn(array $c): bool => $c['openAssignments'] === 0
++            ));
++        }
++
++        return ['chores' => $chores];
++    }
++
++    /** GET /api/chores/{id} */
++    public function show(array $params): array
++    {
++        $chore = $this->chores->find((int)$params['id']);
++        if ($chore === null) {
++            throw new NotFound('Chore not found');
++        }
++        return ['chore' => $chore];
++    }
++
++    /** POST /api/chores */
++    public function create(array $params): array
++    {
++        $title = trim((string)($params['title'] ?? ''));
++        if ($title === '') {
++            throw new BadRequest('A chore needs a title');
++        }
++
++        return ['chore' => $this->chores->insert(
++            $title,
++            (string)($params['description'] ?? ''),
++            (string)($params['frequency'] ?? 'One-time'),
++        )];
++    }
++
++    /** PUT /api/chores/{id} */
++    public function update(array $params): array
++    {
++        $id = (int)$params['id'];
++        if ($this->chores->find($id) === null) {
++            throw new NotFound('Chore not found');
++        }
++
++        $fields = array_intersect_key($params, array_flip(['title', 'description', 'frequency']));
++        if (isset($fields['title']) && trim((string)$fields['title']) === '') {
++            throw new BadRequest('A chore needs a title');
++        }
++
++        return ['chore' => $this->chores->update($id, $fields)];
++    }
++
++    /** DELETE /api/chores/{id} */
++    public function destroy(array $params): array
++    {
++        $this->chores->delete((int)$params['id']);
++        return ['deleted' => true];
+     }
+-    return null;
+-}
+\ No newline at end of file
++
++    /** POST /api/chores/{id}/assign — chore_list.jsx assignChoreToUser */
++    public function assign(array $params): array
++    {
++        $choreId = (int)$params['id'];
++        $userId = (int)($params['userId'] ?? 0);
++
++        $chore = $this->chores->find($choreId);
++        if ($chore === null) {
++            throw new NotFound('Chore not found');
++        }
++        if ($userId === 0) {
++            throw new BadRequest('An assignment needs a user');
++        }
++
++        $dueDate = (string)($params['dueDate'] ?? '');
++        if ($dueDate === '') {
++            $dueDate = Schedule::nextDueDate($chore['frequency'], $chore['lastCompleted'])
++                ->format('Y-m-d');
++        }
++
++        return ['assignment' => $this->assignments->insert(
++            $choreId,
++            $userId,
++            $dueDate,
++            (string)($params['priority'] ?? 'Medium'),
++        )];
++    }
++}
+diff --git a/lib/Controller/HttpException.php b/lib/Controller/HttpException.php
+new file mode 100644
+index 0000000..1b52789
+--- /dev/null
++++ b/lib/Controller/HttpException.php
+@@ -0,0 +1,19 @@
++<?php
++
++namespace ChoreChart\Controller;
++
++use RuntimeException;
++
++/** A controller failure the router turns into a JSON error with a status code. */
++class HttpException extends RuntimeException
++{
++    public function __construct(string $message, private int $status = 500)
++    {
++        parent::__construct($message);
++    }
++
++    public function status(): int
++    {
++        return $this->status;
++    }
++}
+diff --git a/lib/Controller/NotFound.php b/lib/Controller/NotFound.php
+new file mode 100644
+index 0000000..8abaec9
+--- /dev/null
++++ b/lib/Controller/NotFound.php
+@@ -0,0 +1,11 @@
++<?php
++
++namespace ChoreChart\Controller;
++
++class NotFound extends HttpException
++{
++    public function __construct(string $message = 'Not found')
++    {
++        parent::__construct($message, 404);
++    }
++}
+diff --git a/lib/Controller/NotificationController.php b/lib/Controller/NotificationController.php
+new file mode 100644
+index 0000000..0d53e93
+--- /dev/null
++++ b/lib/Controller/NotificationController.php
+@@ -0,0 +1,32 @@
++<?php
++
++namespace ChoreChart\Controller;
++
++use ChoreChart\Db\NotificationMapper;
++
++/** The bell in notify_user.jsx. */
++class NotificationController
++{
++    public function __construct(private NotificationMapper $notifications = new NotificationMapper())
++    {
++    }
++
++    /** GET /api/notifications */
++    public function index(array $params): array
++    {
++        return [
++            'notifications' => $this->notifications->findAll(
++                (int)($params['limit'] ?? 20),
++                ($params['unreadOnly'] ?? '') === '1',
++            ),
++            'unread' => $this->notifications->unreadCount(),
++        ];
++    }
++
++    /** POST /api/notifications/read */
++    public function markRead(array $params): array
++    {
++        $this->notifications->markAllRead();
++        return ['unread' => 0];
++    }
++}
+diff --git a/lib/Controller/PageController.php b/lib/Controller/PageController.php
+index e69de29..b678fb0 100644
+--- a/lib/Controller/PageController.php
++++ b/lib/Controller/PageController.php
+@@ -0,0 +1,30 @@
++<?php
++
++namespace ChoreChart\Controller;
++
++use OCA\ChoreTracker\AppInfo\Application;
++use OCP\AppFramework\Controller;
++use OCP\AppFramework\Http\TemplateResponse;
++use OCP\IRequest;
++
++/**
++ * Serves the app shell under Nextcloud: templates/main.php mounts the built
++ * React bundle. Only Nextcloud loads this — in local development Vite serves
++ * index.html and api/index.php serves the API.
++ */
++class PageController extends Controller
++{
++    public function __construct(IRequest $request)
++    {
++        parent::__construct(Application::APP_ID, $request);
++    }
++
++    /**
++     * @NoAdminRequired
++     * @NoCSRFRequired
++     */
++    public function index(): TemplateResponse
++    {
++        return new TemplateResponse(Application::APP_ID, 'main');
++    }
++}
+diff --git a/lib/Controller/UserController.php b/lib/Controller/UserController.php
+new file mode 100644
+index 0000000..4298a0a
+--- /dev/null
++++ b/lib/Controller/UserController.php
+@@ -0,0 +1,62 @@
++<?php
++
++namespace ChoreChart\Controller;
++
++use ChoreChart\Db\UserMapper;
++use ChoreChart\Service\PointsService;
++
++/** Users and the point bar data behind PointHelpers.jsx. */
++class UserController
++{
++    public function __construct(private UserMapper $users = new UserMapper())
++    {
++    }
++
++    /** GET /api/users */
++    public function index(array $params): array
++    {
++        return ['users' => $this->users->findAll()];
++    }
++
++    /** POST /api/users */
++    public function create(array $params): array
++    {
++        $name = trim((string)($params['name'] ?? ''));
++        if ($name === '') {
++            throw new BadRequest('A user needs a name');
++        }
++        return ['user' => $this->users->insert($name, $params['email'] ?? null)];
++    }
++
++    /** DELETE /api/users/{id} */
++    public function destroy(array $params): array
++    {
++        $this->users->delete((int)$params['id']);
++        return ['deleted' => true];
++    }
++
++    /** GET /api/users/progress — one point bar per user */
++    public function progress(array $params): array
++    {
++        return [
++            'progress' => $this->users->progress(),
++            'history' => PointsService::history(),
++        ];
++    }
++
++    /** GET /api/users/{id}/points — chore_details.jsx updatePointBar */
++    public function points(array $params): array
++    {
++        $id = (int)$params['id'];
++        if ($this->users->find($id) === null) {
++            throw new NotFound('User not found');
++        }
++
++        foreach ($this->users->progress() as $row) {
++            if ($row['id'] === $id) {
++                return $row;
++            }
++        }
++        return ['id' => $id, 'points' => 0];
++    }
++}
+diff --git a/lib/Db/AssignmentMapper.php b/lib/Db/AssignmentMapper.php
+new file mode 100644
+index 0000000..188f1a4
+--- /dev/null
++++ b/lib/Db/AssignmentMapper.php
+@@ -0,0 +1,261 @@
++<?php
++
++namespace ChoreChart\Db;
++
++use ChoreChart\Service\PointsService;
++use ChoreChart\Service\Schedule;
++
++/**
++ * Assignments — a chore given to a user with a due date.
++ *
++ * Rows come back with everything the UI needs already joined and derived, so
++ * chore_list.jsx, chore_details.jsx and calendar.jsx all read the same shape.
++ */
++class AssignmentMapper
++{
++    /** chore_list.jsx: priorityOrder = { high: 1, medium: 2, low: 3 }. */
++    private const PRIORITY_ORDER = ['high' => 1, 'medium' => 2, 'normal' => 2, 'low' => 3];
++
++    private const SELECT = <<<'SQL'
++        SELECT a.id, a.chore_id AS choreId, a.user_id AS userId,
++               c.title AS choreTitle, c.description, c.frequency,
++               u.name AS userName, u.email,
++               a.due_date AS dueDate, a.status, a.priority,
++               a.last_update AS lastUpdate, a.completed_at AS completedAt,
++               (SELECT MAX(x.completed_at) FROM assignments x
++                 WHERE x.chore_id = a.chore_id AND x.status = 'Done' AND x.id != a.id
++               ) AS choreLastCompleted,
++               COALESCE((SELECT SUM(p.points) FROM points_ledger p
++                          WHERE p.assignment_id = a.id), 0) AS pointsAwarded
++        FROM assignments a
++        JOIN chores c ON c.id = a.chore_id
++        JOIN users u ON u.id = a.user_id
++    SQL;
++
++    /**
++     * @param array{status?:string,userId?:int,query?:string,sortBy?:string} $filters
++     */
++    public function findAll(array $filters = []): array
++    {
++        $status = $filters['status'] ?? 'All';
++        $clauses = [];
++        $params = [];
++
++        if ($status === 'Open') {
++            $clauses[] = "a.status != 'Done'";
++        } elseif ($status !== 'All') {
++            $clauses[] = 'a.status = ?';
++            $params[] = $status;
++        }
++
++        if (!empty($filters['userId'])) {
++            $clauses[] = 'a.user_id = ?';
++            $params[] = (int)$filters['userId'];
++        }
++
++        if (!empty($filters['query'])) {
++            $clauses[] = 'LOWER(c.title) LIKE ?';
++            $params[] = '%' . strtolower($filters['query']) . '%';
++        }
++
++        $sql = self::SELECT . ($clauses ? ' WHERE ' . implode(' AND ', $clauses) : '');
++        $stmt = Database::conn()->prepare($sql);
++        $stmt->execute($params);
++
++        $rows = array_map([$this, 'cast'], $stmt->fetchAll());
++        $this->sort($rows, $filters['sortBy'] ?? 'Priority');
++
++        return $rows;
++    }
++
++    public function find(int $id): ?array
++    {
++        $stmt = Database::conn()->prepare(self::SELECT . ' WHERE a.id = ?');
++        $stmt->execute([$id]);
++        $row = $stmt->fetch();
++        return $row ? $this->cast($row) : null;
++    }
++
++    /** The '+' action in chore_list.jsx: assign a chore and notify the user. */
++    public function insert(int $choreId, int $userId, string $dueDate, string $priority = 'Medium'): ?array
++    {
++        $pdo = Database::conn();
++        $stmt = $pdo->prepare(
++            'INSERT INTO assignments (chore_id, user_id, due_date, priority) VALUES (?, ?, ?, ?)'
++        );
++        $stmt->execute([$choreId, $userId, substr($dueDate, 0, 10), $priority]);
++        $assignmentId = (int)$pdo->lastInsertId();
++
++        $assignment = $this->find($assignmentId);
++        if ($assignment !== null) {
++            (new NotificationMapper())->insert(
++                $userId,
++                $assignmentId,
++                "You have been assigned the chore: {$assignment['choreTitle']}"
++            );
++        }
++        return $assignment;
++    }
++
++    public function update(int $id, array $fields): ?array
++    {
++        $columns = [
++            'dueDate' => 'due_date',
++            'priority' => 'priority',
++            'userId' => 'user_id',
++            'status' => 'status',
++            'choreId' => 'chore_id',
++        ];
++
++        $set = [];
++        $params = [];
++        foreach ($columns as $key => $column) {
++            if (!array_key_exists($key, $fields)) {
++                continue;
++            }
++            $set[] = "$column = ?";
++            $params[] = $key === 'dueDate' ? substr((string)$fields[$key], 0, 10) : $fields[$key];
++        }
++
++        if ($set !== []) {
++            $params[] = $id;
++            $stmt = Database::conn()->prepare(
++                'UPDATE assignments SET ' . implode(', ', $set) . ' WHERE id = ?'
++            );
++            $stmt->execute($params);
++        }
++        return $this->find($id);
++    }
++
++    public function delete(int $id): void
++    {
++        PointsService::revoke($id);
++        $stmt = Database::conn()->prepare('DELETE FROM assignments WHERE id = ?');
++        $stmt->execute([$id]);
++    }
++
++    /**
++     * Mark done and award points based on frequency and days since the chore was
++     * last completed (PointHelpers.handleChoreCompletion).
++     *
++     * @return array{assignment:?array,points:int}
++     */
++    public function complete(int $id): array
++    {
++        $row = $this->find($id);
++        if ($row === null) {
++            return ['assignment' => null, 'points' => 0];
++        }
++
++        $points = PointsService::calculate($row['frequency'], $row['choreLastCompleted']);
++
++        $stmt = Database::conn()->prepare(
++            "UPDATE assignments SET status = 'Done', completed_at = ? WHERE id = ?"
++        );
++        $stmt->execute([date('Y-m-d\TH:i:s'), $id]);
++
++        PointsService::revoke($id);
++        PointsService::award($row['userId'], $id, $points, "Completed {$row['choreTitle']}");
++
++        (new NotificationMapper())->insert(
++            $row['userId'],
++            $id,
++            "{$row['userName']} completed {$row['choreTitle']} (+$points points)"
++        );
++
++        return ['assignment' => $this->find($id), 'points' => $points];
++    }
++
++    /**
++     * Reopen and claw the points back (PointHelpers.removePointsAnimation).
++     *
++     * @return array{assignment:?array,pointsRemoved:int}
++     */
++    public function reopen(int $id): array
++    {
++        if ($this->find($id) === null) {
++            return ['assignment' => null, 'pointsRemoved' => 0];
++        }
++
++        $removed = PointsService::revoke($id);
++        $stmt = Database::conn()->prepare(
++            "UPDATE assignments SET status = 'Pending', completed_at = NULL WHERE id = ?"
++        );
++        $stmt->execute([$id]);
++
++        return ['assignment' => $this->find($id), 'pointsRemoved' => $removed];
++    }
++
++    public function addUpdate(int $id, string $text): void
++    {
++        $text = trim($text);
++        $pdo = Database::conn();
++
++        $stmt = $pdo->prepare('INSERT INTO updates (assignment_id, update_text) VALUES (?, ?)');
++        $stmt->execute([$id, $text]);
++
++        $stmt = $pdo->prepare('UPDATE assignments SET last_update = ? WHERE id = ?');
++        $stmt->execute([$text, $id]);
++    }
++
++    public function updates(int $id): array
++    {
++        $stmt = Database::conn()->prepare(
++            'SELECT update_text AS text, created_at AS createdAt FROM updates
++             WHERE assignment_id = ? ORDER BY datetime(created_at) DESC'
++        );
++        $stmt->execute([$id]);
++        return $stmt->fetchAll();
++    }
++
++    private function sort(array &$rows, string $sortBy): void
++    {
++        $rank = static fn(array $r): int => self::PRIORITY_ORDER[strtolower((string)$r['priority'])] ?? 99;
++        $done = static fn(array $r): int => $r['status'] === 'Done' ? 1 : 0;
++
++        usort($rows, static function (array $a, array $b) use ($sortBy, $rank, $done): int {
++            if ($done($a) !== $done($b)) {
++                return $done($a) <=> $done($b);
++            }
++            return match ($sortBy) {
++                'Due date' => [$a['dueDate'], $rank($a)] <=> [$b['dueDate'], $rank($b)],
++                'Assigned user' => [strtolower($a['userName']), $a['dueDate']]
++                    <=> [strtolower($b['userName']), $b['dueDate']],
++                default => [$rank($a), $a['dueDate']] <=> [$rank($b), $b['dueDate']],
++            };
++        });
++    }
++
++    /** Attach the derived schedule fields the UI renders from. */
++    private function cast(array $row): array
++    {
++        $due = Schedule::parseDate($row['dueDate']);
++        $scheduledDue = Schedule::nextDueDate($row['frequency'], $row['choreLastCompleted']);
++        [$state, $suggested] = Schedule::derive($due, $row['frequency']);
++        $isDone = $row['status'] === 'Done';
++
++        return [
++            'id' => (int)$row['id'],
++            'choreId' => (int)$row['choreId'],
++            'userId' => (int)$row['userId'],
++            'choreTitle' => $row['choreTitle'],
++            'description' => $row['description'] ?? '',
++            'frequency' => $row['frequency'],
++            'userName' => $row['userName'],
++            'email' => $row['email'],
++            'dueDate' => substr((string)$row['dueDate'], 0, 10),
++            'status' => $row['status'],
++            'priority' => $row['priority'],
++            'lastUpdate' => $row['lastUpdate'],
++            'completedAt' => $row['completedAt'],
++            'choreLastCompleted' => $row['choreLastCompleted'],
++            'pointsAwarded' => (int)$row['pointsAwarded'],
++            'scheduledDue' => $scheduledDue->format('Y-m-d'),
++            'dueState' => $isDone ? 'Completed' : $state,
++            'suggestedPriority' => $suggested,
++            'pointsIfCompletedToday' => $isDone
++                ? 0
++                : PointsService::calculate($row['frequency'], $row['choreLastCompleted']),
++        ];
++    }
++}
+diff --git a/lib/Db/Chore.php b/lib/Db/Chore.php
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/lib/Db/ChoreMapper.php b/lib/Db/ChoreMapper.php
+index e69de29..18b730f 100644
+--- a/lib/Db/ChoreMapper.php
++++ b/lib/Db/ChoreMapper.php
+@@ -0,0 +1,83 @@
++<?php
++
++namespace ChoreChart\Db;
++
++/**
++ * Chores — the catalogue of things that need doing, independent of who is on
++ * them. `lastCompleted` feeds the points calculation in PointHelpers.jsx and
++ * `openAssignments` marks the rows chore_list.jsx offers a '+' on.
++ */
++class ChoreMapper
++{
++    private const SELECT = <<<'SQL'
++        SELECT c.id, c.title, c.description, c.frequency,
++               (SELECT MAX(a.completed_at) FROM assignments a
++                 WHERE a.chore_id = c.id AND a.status = 'Done') AS lastCompleted,
++               (SELECT COUNT(*) FROM assignments a
++                 WHERE a.chore_id = c.id AND a.status != 'Done') AS openAssignments
++        FROM chores c
++    SQL;
++
++    public function findAll(bool $activeOnly = true): array
++    {
++        $where = $activeOnly ? 'WHERE c.active = 1' : '';
++        $rows = Database::conn()->query(self::SELECT . " $where ORDER BY c.title")->fetchAll();
++        return array_map([$this, 'cast'], $rows);
++    }
++
++    public function find(int $id): ?array
++    {
++        $stmt = Database::conn()->prepare(self::SELECT . ' WHERE c.id = ?');
++        $stmt->execute([$id]);
++        $row = $stmt->fetch();
++        return $row ? $this->cast($row) : null;
++    }
++
++    /** Chores nobody is currently on — the '+' rows in chore_list.jsx. */
++    public function findUnassigned(): array
++    {
++        return array_values(array_filter(
++            $this->findAll(),
++            static fn(array $chore): bool => $chore['openAssignments'] === 0
++        ));
++    }
++
++    public function insert(string $title, string $description, string $frequency): array
++    {
++        $pdo = Database::conn();
++        $stmt = $pdo->prepare(
++            'INSERT INTO chores (title, description, frequency) VALUES (?, ?, ?)'
++        );
++        $stmt->execute([trim($title), trim($description), $frequency]);
++        return $this->find((int)$pdo->lastInsertId());
++    }
++
++    public function update(int $id, array $fields): ?array
++    {
++        $allowed = array_intersect_key($fields, array_flip(['title', 'description', 'frequency']));
++        if ($allowed !== []) {
++            $set = implode(', ', array_map(static fn(string $k): string => "$k = ?", array_keys($allowed)));
++            $stmt = Database::conn()->prepare("UPDATE chores SET $set WHERE id = ?");
++            $stmt->execute([...array_values($allowed), $id]);
++        }
++        return $this->find($id);
++    }
++
++    public function delete(int $id): void
++    {
++        $stmt = Database::conn()->prepare('DELETE FROM chores WHERE id = ?');
++        $stmt->execute([$id]);
++    }
++
++    private function cast(array $row): array
++    {
++        return [
++            'id' => (int)$row['id'],
++            'title' => $row['title'],
++            'description' => $row['description'] ?? '',
++            'frequency' => $row['frequency'],
++            'lastCompleted' => $row['lastCompleted'],
++            'openAssignments' => (int)$row['openAssignments'],
++        ];
++    }
++}
+diff --git a/lib/Db/Database.php b/lib/Db/Database.php
+new file mode 100644
+index 0000000..aec113f
+--- /dev/null
++++ b/lib/Db/Database.php
+@@ -0,0 +1,205 @@
++<?php
++
++namespace ChoreChart\Db;
++
++use PDO;
++
++/**
++ * SQLite connection, schema and seed import.
++ *
++ * The schema matches the one chore_data.py already created in chore_chart.db, so
++ * the existing database keeps working. Under Nextcloud this class is replaced by
++ * the server's IDBConnection; the mappers are the only thing that touch it.
++ */
++class Database
++{
++    private static ?PDO $pdo = null;
++    private static string $path = '';
++
++    public static function path(): string
++    {
++        if (self::$path === '') {
++            self::$path = dirname(__DIR__, 2) . '/chore_chart.db';
++        }
++        return self::$path;
++    }
++
++    public static function setPath(string $path): void
++    {
++        self::$path = $path;
++        self::$pdo = null;
++    }
++
++    public static function conn(): PDO
++    {
++        if (self::$pdo === null) {
++            self::$pdo = new PDO('sqlite:' . self::path(), null, null, [
++                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
++                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
++            ]);
++            self::$pdo->exec('PRAGMA foreign_keys = ON');
++        }
++        return self::$pdo;
++    }
++
++    public static function migrate(): void
++    {
++        self::conn()->exec(<<<'SQL'
++            CREATE TABLE IF NOT EXISTS users (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                name TEXT NOT NULL UNIQUE,
++                email TEXT,
++                active INTEGER NOT NULL DEFAULT 1,
++                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++            );
++
++            CREATE TABLE IF NOT EXISTS chores (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                title TEXT NOT NULL,
++                description TEXT,
++                frequency TEXT NOT NULL DEFAULT 'One-time',
++                active INTEGER NOT NULL DEFAULT 1,
++                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++            );
++
++            CREATE TABLE IF NOT EXISTS assignments (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                chore_id INTEGER NOT NULL,
++                user_id INTEGER NOT NULL,
++                due_date TEXT NOT NULL,
++                status TEXT NOT NULL DEFAULT 'Pending',
++                priority TEXT NOT NULL DEFAULT 'Medium',
++                last_update TEXT,
++                completed_at TEXT,
++                notified_at TEXT,
++                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++                FOREIGN KEY (chore_id) REFERENCES chores(id) ON DELETE CASCADE,
++                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
++            );
++
++            CREATE TABLE IF NOT EXISTS updates (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                assignment_id INTEGER NOT NULL,
++                update_text TEXT NOT NULL,
++                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++                FOREIGN KEY (assignment_id) REFERENCES assignments(id) ON DELETE CASCADE
++            );
++
++            CREATE TABLE IF NOT EXISTS points_ledger (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                user_id INTEGER NOT NULL,
++                assignment_id INTEGER,
++                points INTEGER NOT NULL,
++                reason TEXT,
++                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
++            );
++
++            CREATE TABLE IF NOT EXISTS notifications (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                user_id INTEGER,
++                assignment_id INTEGER,
++                message TEXT NOT NULL,
++                read INTEGER NOT NULL DEFAULT 0,
++                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++            );
++
++            CREATE TABLE IF NOT EXISTS reward_tiers (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                slug TEXT NOT NULL UNIQUE,
++                title TEXT NOT NULL,
++                description TEXT,
++                threshold INTEGER NOT NULL
++            );
++        SQL);
++    }
++
++    /**
++     * Import components/hardcorded_data.json and components/points/rewards.json.
++     *
++     * Additive and safe to re-run: users and chores match on name, so an import
++     * over a populated database adds only what is missing.
++     *
++     * @return array{users_added:int,chores_added:int,tiers_added:int,skipped:int}
++     */
++    public static function seed(): array
++    {
++        $summary = ['users_added' => 0, 'chores_added' => 0, 'tiers_added' => 0, 'skipped' => 0];
++        $components = dirname(__DIR__, 2) . '/components';
++        $pdo = self::conn();
++
++        $seed = self::readJson($components . '/hardcorded_data.json');
++        foreach ($seed['users'] ?? [] as $user) {
++            $name = trim((string)($user['name'] ?? ''));
++            if ($name === '') {
++                continue;
++            }
++            $stmt = $pdo->prepare('INSERT OR IGNORE INTO users (name, email) VALUES (?, ?)');
++            $stmt->execute([$name, $user['email'] ?? null]);
++            $stmt->rowCount() ? $summary['users_added']++ : $summary['skipped']++;
++        }
++
++        foreach ($seed['chores'] ?? [] as $chore) {
++            $title = trim((string)($chore['name'] ?? ''));
++            if ($title === '') {
++                continue;
++            }
++            $exists = $pdo->prepare('SELECT id FROM chores WHERE title = ?');
++            $exists->execute([$title]);
++            if ($exists->fetchColumn() !== false) {
++                $summary['skipped']++;
++                continue;
++            }
++            $stmt = $pdo->prepare(
++                'INSERT INTO chores (title, description, frequency) VALUES (?, ?, ?)'
++            );
++            $stmt->execute([
++                $title,
++                $chore['description'] ?? '',
++                ucfirst((string)($chore['frequency'] ?? 'Weekly')),
++            ]);
++            $summary['chores_added']++;
++        }
++
++        $rewards = self::readJson($components . '/points/rewards.json');
++        foreach ($rewards['user_rewards'] ?? [] as $slug => $tier) {
++            $description = (string)($tier['description'] ?? '');
++            // rewards.json states thresholds in prose: "Earned for completing 10 chores."
++            preg_match('/\d+/', $description, $match);
++            $stmt = $pdo->prepare(
++                'INSERT OR IGNORE INTO reward_tiers (slug, title, description, threshold)
++                 VALUES (?, ?, ?, ?)'
++            );
++            $stmt->execute([
++                $slug,
++                $tier['title'] ?? ucfirst($slug),
++                $description,
++                (int)($match[0] ?? 0),
++            ]);
++            $stmt->rowCount() ? $summary['tiers_added']++ : $summary['skipped']++;
++        }
++
++        return $summary;
++    }
++
++    /** Run the seed import only when there is nothing to show yet. */
++    public static function seedIfEmpty(): void
++    {
++        $pdo = self::conn();
++        $users = (int)$pdo->query('SELECT COUNT(*) FROM users')->fetchColumn();
++        $chores = (int)$pdo->query('SELECT COUNT(*) FROM chores')->fetchColumn();
++        $tiers = (int)$pdo->query('SELECT COUNT(*) FROM reward_tiers')->fetchColumn();
++        if ($users === 0 || $chores === 0 || $tiers === 0) {
++            self::seed();
++        }
++    }
++
++    private static function readJson(string $file): array
++    {
++        if (!is_file($file)) {
++            return [];
++        }
++        $decoded = json_decode((string)file_get_contents($file), true);
++        return is_array($decoded) ? $decoded : [];
++    }
++}
+diff --git a/lib/Db/NotificationMapper.php b/lib/Db/NotificationMapper.php
+new file mode 100644
+index 0000000..c6671e3
+--- /dev/null
++++ b/lib/Db/NotificationMapper.php
+@@ -0,0 +1,48 @@
++<?php
++
++namespace ChoreChart\Db;
++
++/** Notifications behind the bell — port of components/users/notify_user.jsx. */
++class NotificationMapper
++{
++    public function insert(?int $userId, ?int $assignmentId, string $message): void
++    {
++        $stmt = Database::conn()->prepare(
++            'INSERT INTO notifications (user_id, assignment_id, message) VALUES (?, ?, ?)'
++        );
++        $stmt->execute([$userId, $assignmentId, $message]);
++    }
++
++    public function findAll(int $limit = 20, bool $unreadOnly = false): array
++    {
++        $where = $unreadOnly ? 'WHERE n.read = 0' : '';
++        $stmt = Database::conn()->prepare(
++            "SELECT n.id, n.message, n.read, n.created_at AS createdAt,
++                    n.assignment_id AS assignmentId, u.name AS userName
++             FROM notifications n LEFT JOIN users u ON u.id = n.user_id
++             $where ORDER BY datetime(n.created_at) DESC LIMIT ?"
++        );
++        $stmt->execute([$limit]);
++
++        return array_map(static fn(array $row): array => [
++            'id' => (int)$row['id'],
++            'message' => $row['message'],
++            'read' => (bool)$row['read'],
++            'createdAt' => $row['createdAt'],
++            'assignmentId' => $row['assignmentId'] === null ? null : (int)$row['assignmentId'],
++            'userName' => $row['userName'],
++        ], $stmt->fetchAll());
++    }
++
++    public function unreadCount(): int
++    {
++        return (int)Database::conn()
++            ->query('SELECT COUNT(*) FROM notifications WHERE read = 0')
++            ->fetchColumn();
++    }
++
++    public function markAllRead(): void
++    {
++        Database::conn()->exec('UPDATE notifications SET read = 1 WHERE read = 0');
++    }
++}
+diff --git a/lib/Db/RewardTierMapper.php b/lib/Db/RewardTierMapper.php
+new file mode 100644
+index 0000000..40d9e9d
+--- /dev/null
++++ b/lib/Db/RewardTierMapper.php
+@@ -0,0 +1,21 @@
++<?php
++
++namespace ChoreChart\Db;
++
++/** Reward tiers, seeded from components/points/rewards.json. */
++class RewardTierMapper
++{
++    public function findAll(): array
++    {
++        $rows = Database::conn()
++            ->query('SELECT slug, title, description, threshold FROM reward_tiers ORDER BY threshold')
++            ->fetchAll();
++
++        return array_map(static fn(array $row): array => [
++            'slug' => $row['slug'],
++            'title' => $row['title'],
++            'description' => $row['description'],
++            'threshold' => (int)$row['threshold'],
++        ], $rows);
++    }
++}
+diff --git a/lib/Db/UserMapper.php b/lib/Db/UserMapper.php
+new file mode 100644
+index 0000000..e57d6d9
+--- /dev/null
++++ b/lib/Db/UserMapper.php
+@@ -0,0 +1,95 @@
++<?php
++
++namespace ChoreChart\Db;
++
++/**
++ * Users and their point totals.
++ *
++ * `progress()` is the data behind the point bar in PointHelpers.jsx: total
++ * points from the ledger, chores completed, and the reward tier that earns.
++ */
++class UserMapper
++{
++    public function findAll(bool $activeOnly = true): array
++    {
++        $where = $activeOnly ? 'WHERE active = 1' : '';
++        $rows = Database::conn()
++            ->query("SELECT id, name, email FROM users $where ORDER BY name")
++            ->fetchAll();
++        return array_map([$this, 'cast'], $rows);
++    }
++
++    public function find(int $id): ?array
++    {
++        $stmt = Database::conn()->prepare('SELECT id, name, email FROM users WHERE id = ?');
++        $stmt->execute([$id]);
++        $row = $stmt->fetch();
++        return $row ? $this->cast($row) : null;
++    }
++
++    public function insert(string $name, ?string $email): array
++    {
++        $pdo = Database::conn();
++        $stmt = $pdo->prepare('INSERT INTO users (name, email) VALUES (?, ?)');
++        $stmt->execute([trim($name), $email !== null && trim($email) !== '' ? trim($email) : null]);
++        return $this->find((int)$pdo->lastInsertId());
++    }
++
++    public function delete(int $id): void
++    {
++        $stmt = Database::conn()->prepare('DELETE FROM users WHERE id = ?');
++        $stmt->execute([$id]);
++    }
++
++    /** Point-bar data for every active user, with reward tier progress. */
++    public function progress(): array
++    {
++        $rows = Database::conn()->query(
++            "SELECT u.id, u.name,
++                    COALESCE((SELECT SUM(p.points) FROM points_ledger p
++                               WHERE p.user_id = u.id), 0) AS points,
++                    (SELECT COUNT(*) FROM assignments a
++                      WHERE a.user_id = u.id AND a.status = 'Done') AS completed,
++                    (SELECT COUNT(*) FROM assignments a
++                      WHERE a.user_id = u.id AND a.status != 'Done') AS openChores
++             FROM users u WHERE u.active = 1 ORDER BY u.name"
++        )->fetchAll();
++
++        $tiers = (new RewardTierMapper())->findAll();
++
++        return array_map(static function (array $row) use ($tiers): array {
++            $completed = (int)$row['completed'];
++            $earned = array_values(array_filter(
++                $tiers,
++                static fn(array $t): bool => $completed >= $t['threshold']
++            ));
++            $upcoming = array_values(array_filter(
++                $tiers,
++                static fn(array $t): bool => $completed < $t['threshold']
++            ));
++            $next = $upcoming[0] ?? null;
++
++            return [
++                'id' => (int)$row['id'],
++                'name' => $row['name'],
++                'points' => (int)$row['points'],
++                'completed' => $completed,
++                'openChores' => (int)$row['openChores'],
++                'tier' => $earned ? end($earned)['title'] : null,
++                'nextTier' => $next,
++                'progress' => $next && $next['threshold'] > 0
++                    ? min(1.0, $completed / $next['threshold'])
++                    : 1.0,
++            ];
++        }, $rows);
++    }
++
++    private function cast(array $row): array
++    {
++        return [
++            'id' => (int)$row['id'],
++            'name' => $row['name'],
++            'email' => $row['email'],
++        ];
++    }
++}
+diff --git a/lib/Service/PointsService.php b/lib/Service/PointsService.php
+new file mode 100644
+index 0000000..bd05352
+--- /dev/null
++++ b/lib/Service/PointsService.php
+@@ -0,0 +1,89 @@
++<?php
++
++namespace ChoreChart\Service;
++
++use ChoreChart\Db\Database;
++
++/**
++ * Points — PHP port of components/points/PointHelpers.jsx.
++ *
++ *   calculatePoints   -> calculate()
++ *   updateUserPoints  -> award() (one points_ledger row per award)
++ *   removePoints...   -> revoke() (reopening a chore takes the points back)
++ *
++ * The ledger is kept per assignment so an award can be undone exactly rather
++ * than by subtracting a recomputed guess.
++ */
++class PointsService
++{
++    /** PointHelpers.jsx: daily 10, weekly 5, monthly 2; the rest fill its gaps. */
++    private const BASE_POINTS = [
++        'daily' => 10,
++        'weekly' => 5,
++        'biweekly' => 3,
++        'monthly' => 2,
++        'one-time' => 1,
++    ];
++
++    private const MAX_STREAK_DAYS = 30;
++
++    /**
++     * Base points for the frequency times days since the chore was last done,
++     * capped at 30 days. A chore done twice in one day still scores its base
++     * points once, where the JS version would have scored zero.
++     */
++    public static function calculate(?string $frequency, ?string $lastCompleted): int
++    {
++        $base = self::BASE_POINTS[strtolower((string)$frequency)] ?? 0;
++        if ($base === 0) {
++            return 0;
++        }
++
++        $last = Schedule::parseDate($lastCompleted);
++        $days = $last === null ? 1 : (int)$last->diff(Schedule::today())->format('%r%a');
++
++        return $base * max(1, min($days, self::MAX_STREAK_DAYS));
++    }
++
++    public static function award(int $userId, int $assignmentId, int $points, string $reason): void
++    {
++        if ($points === 0) {
++            return;
++        }
++        $stmt = Database::conn()->prepare(
++            'INSERT INTO points_ledger (user_id, assignment_id, points, reason) VALUES (?, ?, ?, ?)'
++        );
++        $stmt->execute([$userId, $assignmentId, $points, $reason]);
++    }
++
++    /** Take back every point awarded for an assignment; returns how many. */
++    public static function revoke(int $assignmentId): int
++    {
++        $pdo = Database::conn();
++        $stmt = $pdo->prepare('SELECT COALESCE(SUM(points), 0) FROM points_ledger WHERE assignment_id = ?');
++        $stmt->execute([$assignmentId]);
++        $removed = (int)$stmt->fetchColumn();
++
++        $stmt = $pdo->prepare('DELETE FROM points_ledger WHERE assignment_id = ?');
++        $stmt->execute([$assignmentId]);
++
++        return $removed;
++    }
++
++    public static function history(int $limit = 25): array
++    {
++        $stmt = Database::conn()->prepare(
++            'SELECT p.points, p.reason, p.created_at AS createdAt, u.name AS user
++             FROM points_ledger p JOIN users u ON u.id = p.user_id
++             ORDER BY datetime(p.created_at) DESC LIMIT ?'
++        );
++        $stmt->execute([$limit]);
++
++        return array_map(static fn(array $row): array => [
++            'points' => (int)$row['points'],
++            'reason' => $row['reason'],
++            'createdAt' => $row['createdAt'],
++            'user' => $row['user'],
++        ], $stmt->fetchAll());
++    }
++}
+diff --git a/lib/Service/Schedule.php b/lib/Service/Schedule.php
+new file mode 100644
+index 0000000..d2ae0ce
+--- /dev/null
++++ b/lib/Service/Schedule.php
+@@ -0,0 +1,88 @@
++<?php
++
++namespace ChoreChart\Service;
++
++use DateTimeImmutable;
++
++/**
++ * Due dates and priority derived from a chore's frequency.
++ *
++ * chore_details.jsx carries `frequency` and `lastCompleted`; a chore is next due
++ * one interval after the last day it was done, and chore_list.jsx's
++ * sortChoresByPriority then reads off high/medium/low from how that date sits
++ * against today.
++ */
++class Schedule
++{
++    /** Days between occurrences; one-time chores never come round again. */
++    private const FREQUENCY_DAYS = [
++        'daily' => 1,
++        'weekly' => 7,
++        'biweekly' => 14,
++        'monthly' => 30,
++        'one-time' => null,
++    ];
++
++    public static function frequencyDays(?string $frequency): ?int
++    {
++        return self::FREQUENCY_DAYS[strtolower((string)$frequency)] ?? null;
++    }
++
++    public static function today(): DateTimeImmutable
++    {
++        return new DateTimeImmutable('today');
++    }
++
++    public static function parseDate(?string $value): ?DateTimeImmutable
++    {
++        if ($value === null || $value === '') {
++            return null;
++        }
++        $parsed = DateTimeImmutable::createFromFormat('!Y-m-d', substr($value, 0, 10));
++        return $parsed ?: null;
++    }
++
++    /**
++     * The day a chore is next due: last completion plus one interval. Never
++     * completed, or one-time, means due today. A recurring chore that slipped
++     * keeps the date it should have been done on, so it still reads as past due.
++     */
++    public static function nextDueDate(?string $frequency, ?string $lastCompleted): DateTimeImmutable
++    {
++        $interval = self::frequencyDays($frequency);
++        $last = self::parseDate($lastCompleted);
++        if ($interval === null || $last === null) {
++            return self::today();
++        }
++        return $last->modify("+$interval days");
++    }
++
++    /**
++     * How far ahead counts as 'due soon' — a quarter of the interval. A day of
++     * slippage matters far more on a daily chore than a monthly one.
++     */
++    public static function dueSoonWindow(?string $frequency): int
++    {
++        $interval = self::frequencyDays($frequency);
++        return $interval === null ? 2 : max(1, (int)ceil($interval / 4));
++    }
++
++    /**
++     * Due state and the priority that state suggests.
++     *
++     * @return array{0:string,1:string}
++     */
++    public static function derive(?DateTimeImmutable $due, ?string $frequency): array
++    {
++        $due ??= self::today();
++        $daysUntilDue = (int)self::today()->diff($due)->format('%r%a');
++
++        if ($daysUntilDue < 0) {
++            return ['Past due', 'High'];
++        }
++        if ($daysUntilDue <= self::dueSoonWindow($frequency)) {
++            return ['Due soon', 'Medium'];
++        }
++        return ['Upcoming', 'Low'];
++    }
++}
+diff --git a/lib/autoload.php b/lib/autoload.php
+new file mode 100644
+index 0000000..6fe5c39
+--- /dev/null
++++ b/lib/autoload.php
+@@ -0,0 +1,15 @@
++<?php
++
++/** PSR-4 autoloader for ChoreChart\ -> lib/. Nextcloud provides its own. */
++spl_autoload_register(static function (string $class): void {
++    $prefix = 'ChoreChart\\';
++    if (!str_starts_with($class, $prefix)) {
++        return;
++    }
++
++    $relative = str_replace('\\', '/', substr($class, strlen($prefix)));
++    $file = __DIR__ . '/' . $relative . '.php';
++    if (is_file($file)) {
++        require_once $file;
++    }
++});
+diff --git a/package.json b/package.json
+index 53cde20..ec1f4b1 100644
+--- a/package.json
++++ b/package.json
+@@ -5,6 +5,7 @@
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
++    "api": "php -S 127.0.0.1:8000 -t . api/index.php",
+     "build": "tsc -b && vite build",
+     "lint": "oxlint",
+     "preview": "vite preview"
+diff --git a/src/App.css b/src/App.css
+index a2e0a4e..07baacf 100644
+--- a/src/App.css
++++ b/src/App.css
+@@ -3,19 +3,46 @@
+   padding: 32px;
+   display: flex;
+   flex-direction: column;
+-  gap: 20px;
++  gap: 18px;
+   background: linear-gradient(135deg, #f7f8ff 0%, #eef4ff 100%);
+ }
+ 
+ .page-header {
+   background: white;
+   border-radius: 24px;
+-  padding: 28px 32px;
++  padding: 24px 32px;
+   box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
++  display: flex;
++  justify-content: space-between;
++  align-items: flex-start;
++  gap: 16px;
++}
++
++.page-header h1 {
++  margin: 0 0 6px;
++  font-size: 2rem;
++  color: #0f172a;
++}
++
++.subtext {
++  margin: 0;
++  color: #475569;
++  max-width: 60ch;
++}
++
++.banner {
++  padding: 12px 16px;
++  border-radius: 14px;
++  font-weight: 600;
++}
++
++.banner.error {
++  background: #fee2e2;
++  color: #991b1b;
+ }
+ 
+ .toast {
+-  padding: 12px 14px;
++  padding: 12px 16px;
+   border-radius: 999px;
+   font-weight: 700;
+   box-shadow: 0 10px 24px rgba(15, 23, 42, 0.12);
+@@ -32,26 +59,178 @@
+   color: #075985;
+ }
+ 
+-.eyebrow {
+-  margin: 0 0 8px;
+-  font-size: 0.9rem;
+-  font-weight: 700;
+-  letter-spacing: 0.16em;
+-  text-transform: uppercase;
+-  color: #6366f1;
++.toast.error {
++  background: #fee2e2;
++  color: #991b1b;
+ }
+ 
+-.page-header h1 {
+-  margin: 0 0 8px;
+-  font-size: 2rem;
+-  color: #0f172a;
++/* --- Notification bell (notify_user.jsx) --- */
++
++.bell {
++  position: relative;
+ }
+ 
+-.subtext {
++.bell-button {
++  position: relative;
++  font-size: 1.4rem;
++  background: #eef2ff;
++  border-radius: 999px;
++  padding: 10px 14px;
++}
++
++.bell-badge {
++  position: absolute;
++  top: -2px;
++  right: -2px;
++  background: #dc2626;
++  color: white;
++  border-radius: 999px;
++  font-size: 0.7rem;
++  min-width: 20px;
++  padding: 2px 5px;
++}
++
++.bell-dropdown {
++  position: absolute;
++  right: 0;
++  top: calc(100% + 8px);
++  width: min(360px, 80vw);
++  background: white;
++  border: 1px solid #e2e8f0;
++  border-radius: 16px;
++  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.18);
++  padding: 14px;
++  z-index: 20;
++}
++
++.bell-header {
++  display: flex;
++  justify-content: space-between;
++  align-items: center;
++  margin-bottom: 10px;
++}
++
++.bell-list {
++  list-style: none;
+   margin: 0;
+-  color: #475569;
++  padding: 0;
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++  max-height: 320px;
++  overflow-y: auto;
++}
++
++.bell-list li {
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++  padding: 8px 10px;
++  border-radius: 10px;
++  background: #f8fafc;
++  border-left: 3px solid transparent;
++}
++
++.bell-list li.unread {
++  border-left-color: #f59e0b;
++  background: #fffbeb;
++}
++
++.bell-list small {
++  color: #64748b;
++}
++
++/* --- Point bars (PointHelpers.jsx) --- */
++
++.point-card {
++  background: white;
++  border-radius: 20px;
++  padding: 18px 22px;
++  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
++}
++
++.point-card h2 {
++  margin: 0 0 12px;
++  font-size: 1.05rem;
++  color: #0f172a;
++}
++
++.point-grid {
++  display: flex;
++  flex-direction: column;
++  gap: 10px;
++}
++
++.point-row {
++  display: grid;
++  grid-template-columns: minmax(9rem, 12rem) 1fr;
++  gap: 6px 16px;
++  align-items: center;
++}
++
++.point-name {
++  font-weight: 700;
++  color: #0f172a;
++}
++
++.point-tier {
++  display: block;
++  font-weight: 400;
++  font-size: 0.78rem;
++  color: #64748b;
++}
++
++.point-delta {
++  margin-left: 6px;
++  font-size: 0.8rem;
++  font-weight: 800;
++}
++
++.point-delta.up {
++  color: #16a34a;
++}
++
++.point-delta.down {
++  color: #dc2626;
++}
++
++.point-track {
++  background: #e2e8f0;
++  border-radius: 999px;
++  height: 1.4rem;
++  overflow: hidden;
++}
++
++.point-fill {
++  height: 100%;
++  min-width: 4.5rem;
++  border-radius: 999px;
++  background: #3d7be0;
++  color: white;
++  font-size: 0.74rem;
++  line-height: 1.4rem;
++  text-align: right;
++  padding-right: 10px;
++  box-sizing: border-box;
++  /* PointHelpers.jsx: 'width 0.5s ease-in-out' */
++  transition: width 0.5s ease-in-out, background-color 0.4s ease-in-out;
++}
++
++.point-fill.up {
++  background: #16a34a;
++}
++
++.point-fill.down {
++  background: #dc2626;
++}
++
++.point-goal {
++  font-size: 0.75rem;
++  color: #64748b;
+ }
+ 
++/* --- Tabs and filters --- */
++
+ .tabs {
+   display: flex;
+   flex-wrap: wrap;
+@@ -62,7 +241,7 @@
+   border: 1px solid #dbe2f0;
+   background: white;
+   color: #334155;
+-  padding: 10px 14px;
++  padding: 10px 16px;
+   border-radius: 999px;
+   cursor: pointer;
+   font-weight: 600;
+@@ -74,32 +253,46 @@
+   border-color: #4f46e5;
+ }
+ 
+-.panel {
++.filters {
+   background: white;
+-  border-radius: 24px;
+-  padding: 24px;
++  border-radius: 20px;
++  padding: 16px 20px;
+   box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+   display: flex;
+-  flex-direction: column;
+-  gap: 18px;
++  flex-wrap: wrap;
++  gap: 14px;
++  align-items: flex-end;
++}
++
++.filters label {
++  margin-bottom: 0;
++  min-width: 150px;
++}
++
++.metrics {
++  margin-left: auto;
++  display: flex;
++  gap: 16px;
++  font-size: 0.85rem;
++  color: #475569;
++  align-self: center;
+ }
+ 
++/* --- Panels and lists --- */
++
+ .panel-grid {
+   display: grid;
+-  grid-template-columns: repeat(2, minmax(280px, 1fr));
++  grid-template-columns: repeat(2, minmax(320px, 1fr));
+   gap: 18px;
+   align-items: start;
+ }
+ 
+-.panel-grid.three-up {
+-  grid-template-columns: repeat(3, minmax(220px, 1fr));
+-}
+-
+ .panel-card {
++  background: white;
+   border: 1px solid #e2e8f0;
+-  border-radius: 18px;
+-  padding: 18px;
+-  background: #fbfdff;
++  border-radius: 20px;
++  padding: 20px;
++  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06);
+ }
+ 
+ .panel-card h2 {
+@@ -107,10 +300,10 @@
+   color: #0f172a;
+ }
+ 
+-.form-grid {
+-  display: grid;
+-  grid-template-columns: repeat(1, minmax(0, 1fr));
+-  gap: 12px;
++.panel-card h3 {
++  margin: 18px 0 8px;
++  color: #0f172a;
++  font-size: 1rem;
+ }
+ 
+ label {
+@@ -134,25 +327,41 @@ textarea,
+ select {
+   border: 1px solid #cbd5e1;
+   border-radius: 12px;
+-  padding: 10px 12px;
++  padding: 9px 12px;
+   background: white;
+ }
+ 
+ button {
+   border: none;
+   border-radius: 999px;
+-  padding: 10px 14px;
++  padding: 9px 16px;
+   cursor: pointer;
+   background: #e2e8f0;
+   color: #0f172a;
+   font-weight: 700;
+ }
+ 
++button:disabled {
++  opacity: 0.5;
++  cursor: not-allowed;
++}
++
+ button.primary {
+   background: #4f46e5;
+   color: white;
+ }
+ 
++button.danger {
++  background: #fee2e2;
++  color: #991b1b;
++}
++
++.button-row {
++  display: flex;
++  gap: 8px;
++  flex-wrap: wrap;
++}
++
+ .list-card {
+   margin-top: 12px;
+   display: flex;
+@@ -163,22 +372,46 @@ button.primary {
+ .list-row {
+   display: flex;
+   justify-content: space-between;
+-  gap: 10px;
+-  padding: 10px 12px;
++  gap: 12px;
++  padding: 12px 14px;
+   background: #f8fafc;
+-  border-radius: 12px;
++  border-radius: 14px;
++  align-items: flex-start;
++  margin-bottom: 8px;
++}
++
++.list-row.compact {
+   align-items: center;
++  padding: 8px 12px;
+ }
+ 
+-.list-row.stacked {
++.list-row.assignment {
+   flex-direction: column;
++}
++
++.list-row.assignment.done {
++  opacity: 0.7;
++}
++
++.assignment-head {
++  display: flex;
++  justify-content: space-between;
++  gap: 12px;
++  width: 100%;
+   align-items: flex-start;
+ }
+ 
+ .list-details {
+   display: flex;
+   flex-direction: column;
+-  gap: 4px;
++  gap: 3px;
++  font-size: 0.9rem;
++  color: #475569;
++}
++
++.list-details strong {
++  color: #0f172a;
++  font-size: 1rem;
+ }
+ 
+ .inline-editor {
+@@ -192,10 +425,83 @@ button.primary {
+   color: #64748b;
+ }
+ 
++.points-badge {
++  background: #dcfce7;
++  color: #166534;
++  border-radius: 999px;
++  padding: 2px 10px;
++  font-weight: 700;
++  font-size: 0.85rem;
++}
++
++/* --- Assign popover (the '+' in chore_list.jsx) --- */
++
++.assign-toggle {
++  font-size: 1.1rem;
++  background: #eef2ff;
++}
++
++.assign-form {
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++  min-width: 190px;
++}
++
++/* --- Chore details (chore_details.jsx) --- */
++
++.chore-details {
++  width: 100%;
++  margin-top: 12px;
++  padding-top: 12px;
++  border-top: 1px dashed #cbd5e1;
++  display: flex;
++  flex-direction: column;
++  gap: 14px;
++}
++
++.detail-grid {
++  display: grid;
++  grid-template-columns: repeat(2, minmax(240px, 1fr));
++  gap: 16px;
++}
++
++.detail-grid dl {
++  margin: 0;
++  display: grid;
++  grid-template-columns: max-content 1fr;
++  gap: 4px 12px;
++  font-size: 0.88rem;
++}
++
++.detail-grid dt {
++  font-weight: 700;
++  color: #334155;
++}
++
++.detail-grid dd {
++  margin: 0;
++  color: #475569;
++}
++
++.detail-editor {
++  display: flex;
++  gap: 12px;
++  flex-wrap: wrap;
++}
++
++.detail-editor label {
++  margin-bottom: 0;
++  min-width: 160px;
++}
++
++/* --- Calendar (calendar.jsx) --- */
++
+ .calendar-layout {
+   display: grid;
+   grid-template-columns: 2fr 1fr;
+   gap: 18px;
++  align-items: start;
+ }
+ 
+ .calendar-header {
+@@ -203,39 +509,47 @@ button.primary {
+   justify-content: space-between;
+   align-items: center;
+   gap: 12px;
+-  margin-bottom: 10px;
++  margin-bottom: 12px;
++}
++
++.calendar-header h2 {
++  margin: 0;
+ }
+ 
+ .calendar-grid {
+   display: grid;
+   grid-template-columns: repeat(7, minmax(0, 1fr));
+-  gap: 8px;
++  gap: 6px;
+ }
+ 
+ .calendar-day-label {
+   text-align: center;
+   font-weight: 700;
+   color: #64748b;
+-  font-size: 0.9rem;
++  font-size: 0.85rem;
+   padding-bottom: 4px;
+ }
+ 
+ .calendar-cell {
+-  min-height: 78px;
++  min-height: 92px;
+   border: 1px solid #e2e8f0;
+   border-radius: 12px;
+   background: #fff;
+-  padding: 8px;
++  padding: 6px;
+   display: flex;
+   flex-direction: column;
+-  align-items: flex-start;
+-  justify-content: flex-start;
+-  gap: 4px;
++  align-items: stretch;
++  gap: 3px;
+   text-align: left;
++  font-weight: 400;
++}
++
++.calendar-cell.outside {
++  opacity: 0.45;
+ }
+ 
+-.calendar-cell.muted {
+-  opacity: 0.55;
++.calendar-cell.today {
++  border-color: #f59e0b;
+ }
+ 
+ .calendar-cell.selected {
+@@ -243,27 +557,95 @@ button.primary {
+   box-shadow: inset 0 0 0 1px #4f46e5;
+ }
+ 
+-.calendar-cell small {
+-  color: #4f46e5;
++.calendar-date {
+   font-weight: 700;
++  color: #0f172a;
++  font-size: 0.85rem;
+ }
+ 
+-.calendar-form {
+-  margin-top: 16px;
++.calendar-chip {
++  font-size: 0.68rem;
++  border-radius: 6px;
++  padding: 2px 5px;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++  background: #e2e8f0;
++  color: #0f172a;
++}
++
++.calendar-chip.past-due {
++  background: #fee2e2;
++  color: #991b1b;
++}
++
++.calendar-chip.due-soon {
++  background: #ffedd5;
++  color: #9a3412;
++}
++
++.calendar-chip.upcoming {
++  background: #dbeafe;
++  color: #1e40af;
++}
++
++.calendar-chip.completed {
++  background: #dcfce7;
++  color: #166534;
++}
++
++.calendar-cell small {
++  color: #64748b;
++  font-size: 0.65rem;
++}
++
++.calendar-legend {
++  margin: 14px 0 0;
++  font-size: 0.8rem;
+   display: flex;
+-  flex-direction: column;
+-  gap: 4px;
++  gap: 14px;
++  flex-wrap: wrap;
+ }
+ 
+-@media (max-width: 900px) {
++.calendar-form {
++  margin-top: 18px;
++  padding-top: 14px;
++  border-top: 1px dashed #cbd5e1;
++}
++
++.past-due {
++  color: #dc2626;
++}
++
++.due-soon {
++  color: #ea580c;
++}
++
++.upcoming {
++  color: #2563eb;
++}
++
++.completed {
++  color: #16a34a;
++}
++
++@media (max-width: 1000px) {
+   .panel-grid,
+-  .panel-grid.three-up,
+   .calendar-layout,
+-  .form-grid {
++  .detail-grid,
++  .point-row {
+     grid-template-columns: 1fr;
+   }
+ 
+   .app-shell {
+-    padding: 18px;
++    padding: 16px;
++  }
++
++  .page-header {
++    flex-direction: column;
++  }
++
++  .metrics {
++    margin-left: 0;
+   }
+ }
+diff --git a/src/App.tsx b/src/App.tsx
+index 29b0161..eb2705a 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -1,669 +1,323 @@
+-import { useEffect, useMemo, useState } from 'react'
++import { useCallback, useEffect, useState } from 'react'
+ import './App.css'
+-
+-type TabKey = 'settings' | 'lists' | 'calendar'
+-type AssignmentStatus = 'Pending' | 'In Progress' | 'Done'
+-type AssignmentPriority = 'Low' | 'Normal' | 'High'
+-
+-type User = {
+-  id: number
+-  name: string
+-  email?: string
+-}
+-
+-type Chore = {
+-  id: number
+-  title: string
+-  description?: string
+-  frequency: string
+-}
+-
+-type Assignment = {
+-  id: number
+-  choreId: number
+-  userId: number
+-  choreTitle: string
+-  userName: string
+-  dueDate: string
+-  status: AssignmentStatus
+-  priority: AssignmentPriority
+-}
+-
+-function toInputDate(date: Date) {
+-  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().split('T')[0]
+-}
+-
+-function formatDateLabel(date: string) {
+-  const [year, month, day] = date.split('-').map(Number)
+-  return new Date(year, month - 1, day).toLocaleDateString(undefined, {
+-    month: 'short',
+-    day: 'numeric',
+-    year: 'numeric',
+-  })
+-}
+-
+-function getCalendarCells(viewMonth: Date) {
+-  const year = viewMonth.getFullYear()
+-  const month = viewMonth.getMonth()
+-  const firstOfMonth = new Date(year, month, 1)
+-  const firstDay = (firstOfMonth.getDay() + 6) % 7
+-  const daysInMonth = new Date(year, month + 1, 0).getDate()
+-  const cells: Array<{ date: Date; inMonth: boolean }> = []
+-
+-  for (let index = 0; index < firstDay; index += 1) {
+-    const date = new Date(year, month, index - firstDay + 1)
+-    cells.push({ date, inMonth: false })
+-  }
+-
+-  for (let day = 1; day <= daysInMonth; day += 1) {
+-    cells.push({ date: new Date(year, month, day), inMonth: true })
+-  }
+-
+-  while (cells.length % 7 !== 0) {
+-    const last = cells[cells.length - 1]?.date ?? new Date(year, month, 1)
+-    cells.push({ date: new Date(last.getFullYear(), last.getMonth(), last.getDate() + 1), inMonth: false })
+-  }
+-
+-  return cells
+-}
++import {
++  api,
++  type Assignment,
++  type Chore,
++  type Notification,
++  type PointsEntry,
++  type User,
++  type UserProgress,
++} from './api'
++import Calendar from './components/Calendar'
++import ChoreList from './components/ChoreList'
++import NotificationBell from './components/NotificationBell'
++import PointBar from './components/PointBar'
++import Settings from './components/Settings'
++
++type TabKey = 'chores' | 'calendar' | 'settings'
++
++const TABS: Array<[TabKey, string]> = [
++  ['chores', '🧽 Chores'],
++  ['calendar', '📅 Calendar'],
++  ['settings', '⚙️ Settings'],
++]
+ 
+ function App() {
+-  const today = toInputDate(new Date())
+-  const [activeTab, setActiveTab] = useState<TabKey>('settings')
+-  const [users] = useState<User[]>(() => {
+-    const saved = window.localStorage.getItem('chore-chart-users')
+-    return saved ? JSON.parse(saved) : [
+-      { id: 1, name: 'Ava', email: 'ava@example.com' },
+-    ]
+-  })
+-  const [chores, setChores] = useState<Chore[]>(() => {
+-    const saved = window.localStorage.getItem('chore-chart-chores')
+-    return saved ? JSON.parse(saved) : [
+-      { id: 1, title: 'Take out trash', description: 'Empty bins and replace liners.', frequency: 'Weekly' },
+-      { id: 2, title: 'Mop kitchen floor', description: 'Focus on the tile near the sink.', frequency: 'Weekly' },
+-    ]
+-  })
+-  const [assignments, setAssignments] = useState<Assignment[]>(() => {
+-    const saved = window.localStorage.getItem('chore-chart-assignments')
+-    return saved ? JSON.parse(saved) : [
+-      {
+-        id: 1,
+-        choreId: 1,
+-        userId: 1,
+-        choreTitle: 'Take out trash',
+-        userName: 'Ava',
+-        dueDate: today,
+-        status: 'Pending',
+-        priority: 'High',
+-      },
+-      {
+-        id: 2,
+-        choreId: 2,
+-        userId: 1,
+-        choreTitle: 'Mop kitchen floor',
+-        userName: 'Ava',
+-        dueDate: today,
+-        status: 'In Progress',
+-        priority: 'Normal',
+-      },
+-    ]
+-  })
+-
+-  const [choreTitle, setChoreTitle] = useState('')
+-  const [choreDescription, setChoreDescription] = useState('')
+-  const [frequency, setFrequency] = useState('Weekly')
+-  const [editingChoreId, setEditingChoreId] = useState<number | null>(null)
+-  const [editingChoreDraft, setEditingChoreDraft] = useState({ title: '', description: '', frequency: 'Weekly' })
+-  const [selectedChoreId, setSelectedChoreId] = useState<number | ''>(chores[0]?.id ?? '')
+-  const [selectedUserId, setSelectedUserId] = useState<number | ''>(users[0]?.id ?? '')
+-  const [assignmentDate, setAssignmentDate] = useState(today)
+-  const [assignmentStatus, setAssignmentStatus] = useState<AssignmentStatus>('Pending')
+-  const [assignmentPriority, setAssignmentPriority] = useState<AssignmentPriority>('Normal')
+-  const [calendarMonth, setCalendarMonth] = useState(new Date())
+-  const [selectedDate, setSelectedDate] = useState(today)
+-  const [editingAssignmentId, setEditingAssignmentId] = useState<number | null>(null)
+-  const [editingAssignmentDraft, setEditingAssignmentDraft] = useState({
+-    choreId: 0,
+-    userId: 0,
+-    dueDate: today,
+-    status: 'Pending' as AssignmentStatus,
+-    priority: 'Normal' as AssignmentPriority,
+-  })
+-  const [notification, setNotification] = useState<{ message: string; tone: 'success' | 'info' } | null>(null)
+-
+-  const pendingAssignments = useMemo(() => assignments.filter((item) => item.status !== 'Done'), [assignments])
+-  const doneAssignments = useMemo(() => assignments.filter((item) => item.status === 'Done'), [assignments])
+-  const notAssignedChores = useMemo(
+-    () => chores.filter((chore) => !assignments.some((item) => item.choreId === chore.id)),
+-    [assignments, chores],
+-  )
+-  const selectedDateAssignments = useMemo(
+-    () => assignments.filter((item) => item.dueDate === selectedDate),
+-    [assignments, selectedDate],
+-  )
+-  const calendarCells = useMemo(() => getCalendarCells(calendarMonth), [calendarMonth])
+-
+-  useEffect(() => {
+-    window.localStorage.setItem('chore-chart-users', JSON.stringify(users))
+-  }, [users])
+-
+-  useEffect(() => {
+-    window.localStorage.setItem('chore-chart-chores', JSON.stringify(chores))
+-  }, [chores])
++  const [activeTab, setActiveTab] = useState<TabKey>('chores')
++
++  const [users, setUsers] = useState<User[]>([])
++  const [chores, setChores] = useState<Chore[]>([])
++  const [assignments, setAssignments] = useState<Assignment[]>([])
++  const [progress, setProgress] = useState<UserProgress[]>([])
++  const [history, setHistory] = useState<PointsEntry[]>([])
++  const [notifications, setNotifications] = useState<Notification[]>([])
++  const [unread, setUnread] = useState(0)
++
++  const [status, setStatus] = useState('All')
++  const [userFilter, setUserFilter] = useState(0)
++  const [query, setQuery] = useState('')
++  const [sortBy, setSortBy] = useState('Priority')
++
++  const [loading, setLoading] = useState(true)
++  const [error, setError] = useState<string | null>(null)
++  const [toast, setToast] = useState<{ message: string; tone: 'success' | 'info' | 'error' } | null>(null)
++
++  const reload = useCallback(async () => {
++    try {
++      const [nextUsers, nextChores, nextAssignments, nextProgress, nextNotifications] =
++        await Promise.all([
++          api.users(),
++          api.chores(),
++          api.assignments({ status, userId: userFilter, query, sortBy }),
++          api.progress(),
++          api.notifications(),
++        ])
++
++      setUsers(nextUsers)
++      setChores(nextChores)
++      setAssignments(nextAssignments)
++      setProgress(nextProgress.progress)
++      setHistory(nextProgress.history)
++      setNotifications(nextNotifications.notifications)
++      setUnread(nextNotifications.unread)
++      setError(null)
++    } catch (cause) {
++      setError(cause instanceof Error ? cause.message : 'Could not reach the API')
++    } finally {
++      setLoading(false)
++    }
++  }, [status, userFilter, query, sortBy])
+ 
+   useEffect(() => {
+-    window.localStorage.setItem('chore-chart-assignments', JSON.stringify(assignments))
+-  }, [assignments])
++    void reload()
++  }, [reload])
+ 
+   useEffect(() => {
+-    if (!notification) return
+-    const timer = window.setTimeout(() => setNotification(null), 2400)
++    if (!toast) return
++    const timer = window.setTimeout(() => setToast(null), 2600)
+     return () => window.clearTimeout(timer)
+-  }, [notification])
+-
+-  const pushNotification = (message: string, tone: 'success' | 'info' = 'success') => {
+-    setNotification({ message, tone })
+-  }
+-
+-  const handleAddChore = () => {
+-    if (!choreTitle.trim()) return
+-    const nextChore: Chore = {
+-      id: Date.now(),
+-      title: choreTitle.trim(),
+-      description: choreDescription.trim(),
+-      frequency,
++  }, [toast])
++
++  /** Run a mutation, refresh from the server, and say what happened. */
++  const run = async (action: () => Promise<string>) => {
++    try {
++      const message = await action()
++      await reload()
++      setToast({ message, tone: 'success' })
++    } catch (cause) {
++      setToast({
++        message: cause instanceof Error ? cause.message : 'Something went wrong',
++        tone: 'error',
++      })
+     }
+-    setChores((current) => [...current, nextChore])
+-    setSelectedChoreId(nextChore.id)
+-    setChoreTitle('')
+-    setChoreDescription('')
+-    setFrequency('Weekly')
+-    pushNotification('Chore added')
+   }
+ 
+-  const handleStartChoreEdit = (chore: Chore) => {
+-    setEditingChoreId(chore.id)
+-    setEditingChoreDraft({
+-      title: chore.title,
+-      description: chore.description ?? '',
+-      frequency: chore.frequency,
+-    })
+-  }
+-
+-  const handleSaveChoreEdit = (choreId: number) => {
+-    const title = editingChoreDraft.title.trim()
+-    if (!title) return
+-
+-    setChores((current) =>
+-      current.map((chore) =>
+-        chore.id === choreId
+-          ? {
+-              ...chore,
+-              title,
+-              description: editingChoreDraft.description.trim(),
+-              frequency: editingChoreDraft.frequency,
+-            }
+-          : chore,
+-      ),
+-    )
+-    setAssignments((current) =>
+-      current.map((assignment) =>
+-        assignment.choreId === choreId ? { ...assignment, choreTitle: title } : assignment,
+-      ),
+-    )
+-    setEditingChoreId(null)
+-    pushNotification('Chore updated')
+-  }
+-
+-  const handleCancelChoreEdit = () => {
+-    setEditingChoreId(null)
+-    setEditingChoreDraft({ title: '', description: '', frequency: 'Weekly' })
+-  }
+-
+-  const handleDeleteChore = (choreId: number) => {
+-    setChores((current) => current.filter((chore) => chore.id !== choreId))
+-    setAssignments((current) => current.filter((assignment) => assignment.choreId !== choreId))
+-    pushNotification('Chore deleted')
+-  }
+-
+-  const handleStartAssignmentEdit = (assignment: Assignment) => {
+-    setEditingAssignmentId(assignment.id)
+-    setEditingAssignmentDraft({
+-      choreId: assignment.choreId,
+-      userId: assignment.userId,
+-      dueDate: assignment.dueDate,
+-      status: assignment.status,
+-      priority: assignment.priority,
+-    })
+-  }
+-
+-  const handleSaveAssignmentEdit = (assignmentId: number) => {
+-    const chore = chores.find((item) => item.id === editingAssignmentDraft.choreId)
+-    const user = users.find((item) => item.id === editingAssignmentDraft.userId)
+-    if (!chore || !user) return
+-
+-    setAssignments((current) =>
+-      current.map((assignment) =>
+-        assignment.id === assignmentId
+-          ? {
+-              ...assignment,
+-              choreId: chore.id,
+-              userId: user.id,
+-              choreTitle: chore.title,
+-              userName: user.name,
+-              dueDate: editingAssignmentDraft.dueDate,
+-              status: editingAssignmentDraft.status,
+-              priority: editingAssignmentDraft.priority,
+-            }
+-          : assignment,
+-      ),
+-    )
+-    setEditingAssignmentId(null)
+-    pushNotification('Assignment updated')
+-  }
+-
+-  const handleDeleteAssignment = (assignmentId: number) => {
+-    setAssignments((current) => current.filter((assignment) => assignment.id !== assignmentId))
+-    pushNotification('Assignment deleted')
+-  }
+-
+-  const handleAddAssignment = () => {
+-    if (selectedChoreId === '' || selectedUserId === '') return
+-
+-    const chore = chores.find((item) => item.id === selectedChoreId)
+-    const user = users.find((item) => item.id === selectedUserId)
+-    if (!chore || !user) return
+-
+-    const nextAssignment: Assignment = {
+-      id: Date.now(),
+-      choreId: chore.id,
+-      userId: user.id,
+-      choreTitle: chore.title,
+-      userName: user.name,
+-      dueDate: assignmentDate,
+-      status: assignmentStatus,
+-      priority: assignmentPriority,
+-    }
+-
+-    setAssignments((current) => [nextAssignment, ...current])
+-    setAssignmentDate(assignmentDate)
+-    setAssignmentStatus('Pending')
+-    setAssignmentPriority('Normal')
+-    setSelectedDate(assignmentDate)
+-    pushNotification('Assignment saved')
+-  }
+-
+-  const handleSelectCalendarDate = (date: string) => {
+-    setSelectedDate(date)
+-    setAssignmentDate(date)
+-  }
++  const openCount = assignments.filter((item) => item.status !== 'Done').length
++  const pastDue = assignments.filter((item) => item.dueState === 'Past due').length
++  const dueSoon = assignments.filter((item) => item.dueState === 'Due soon').length
++  const completed = assignments.filter((item) => item.status === 'Done').length
+ 
+   return (
+     <div className="app-shell">
+       <header className="page-header">
+-        <h1>🧹 Chore Chart</h1>
++        <div>
++          <h1>🧹 Chore Chart</h1>
++          <p className="subtext">
++            Points scale with each chore's frequency and how long it had been since it was last done.
++          </p>
++        </div>
++        <NotificationBell
++          notifications={notifications}
++          unread={unread}
++          onMarkRead={() =>
++            void run(async () => {
++              await api.markNotificationsRead()
++              return 'Notifications marked read'
++            })
++          }
++        />
+       </header>
+ 
+-      {notification ? (
+-        <div className={`toast ${notification.tone}`}>{notification.message}</div>
++      {error ? (
++        <div className="banner error">
++          {error} — is the API running? Start it with <code>npm run api</code>.
++        </div>
+       ) : null}
+ 
++      {toast ? <div className={`toast ${toast.tone}`}>{toast.message}</div> : null}
++
++      <PointBar progress={progress} />
++
+       <nav className="tabs" aria-label="Chore sections">
+-        {[
+-          ['lists', 'Chore lists'],
+-          ['calendar', 'Calendar'],
+-          ['settings', 'Settings']
+-        ].map(([key, label]) => (
++        {TABS.map(([key, label]) => (
+           <button
+             key={key}
+             type="button"
+             className={`tab-button ${activeTab === key ? 'active' : ''}`}
+-            onClick={() => setActiveTab(key as TabKey)}
++            onClick={() => setActiveTab(key)}
+           >
+             {label}
+           </button>
+         ))}
+       </nav>
+ 
+-      {activeTab === 'lists' && (
+-        <section className="panel">
+-          <div className="panel-grid three-up">
+-            <div className="panel-card">
+-              <h2>Pending</h2>
+-              {pendingAssignments.length === 0 ? (
+-                <p className="muted">No pending chores.</p>
+-              ) : (
+-                pendingAssignments.map((item) => (
+-                  <div key={item.id} className="list-row stacked">
+-                    <div className="list-details">
+-                      <strong>{item.choreTitle}</strong>
+-                      <span>{item.userName}</span>
+-                      <span>{item.dueDate}</span>
+-                    </div>
+-                    <div className="button-row">
+-                      <button type="button" onClick={() => handleStartAssignmentEdit(item)}>Edit</button>
+-                      <button type="button" onClick={() => handleDeleteAssignment(item.id)}>Delete</button>
+-                    </div>
+-                  </div>
+-                ))
+-              )}
+-            </div>
+-            <div className="panel-card">
+-              <h2>Done</h2>
+-              {doneAssignments.length === 0 ? (
+-                <p className="muted">No completed chores yet.</p>
+-              ) : (
+-                doneAssignments.map((item) => (
+-                  <div key={item.id} className="list-row stacked">
+-                    <div className="list-details">
+-                      <strong>{item.choreTitle}</strong>
+-                      <span>{item.userName}</span>
+-                      <span>{item.dueDate}</span>
+-                    </div>
+-                    <div className="button-row">
+-                      <button type="button" onClick={() => handleStartAssignmentEdit(item)}>Edit</button>
+-                      <button type="button" onClick={() => handleDeleteAssignment(item.id)}>Delete</button>
+-                    </div>
+-                  </div>
+-                ))
+-              )}
+-            </div>
+-            <div className="panel-card">
+-              <h2>Not assigned</h2>
+-              {notAssignedChores.length === 0 ? (
+-                <p className="muted">Every chore is assigned.</p>
+-              ) : (
+-                notAssignedChores.map((chore) => (
+-                  <div key={chore.id} className="list-row stacked">
+-                    <strong>{chore.title}</strong>
+-                    <span>{chore.frequency}</span>
+-                  </div>
+-                ))
+-              )}
+-            </div>
+-          </div>
+-        </section>
+-      )}
+-
+-      {activeTab === 'calendar' && (
+-        <section className="panel calendar-layout">
+-          <div className="panel-card calendar-card">
+-            <div className="calendar-header">
+-              <button type="button" onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() - 1, 1))}>
+-                ← Previous
+-              </button>
+-              <h2>{calendarMonth.toLocaleDateString(undefined, { month: 'long', year: 'numeric' })}</h2>
+-              <button type="button" onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() + 1, 1))}>
+-                Next →
+-              </button>
+-            </div>
+-            <div className="calendar-grid" role="grid">
+-              {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((day) => (
+-                <div key={day} className="calendar-day-label">
+-                  {day}
+-                </div>
++      {loading ? <p className="muted">Loading chores…</p> : null}
++
++      {activeTab !== 'settings' ? (
++        <section className="filters">
++          <label>
++            Status
++            <select value={status} onChange={(event) => setStatus(event.target.value)}>
++              {['All', 'Open', 'Pending', 'In Progress', 'Done'].map((item) => (
++                <option key={item} value={item}>
++                  {item}
++                </option>
+               ))}
+-              {calendarCells.map((cell, index) => {
+-                const dateValue = toInputDate(cell.date)
+-                const hasAssignments = assignments.some((item) => item.dueDate === dateValue)
+-                const isSelected = dateValue === selectedDate
+-                return (
+-                  <button
+-                    key={`${dateValue}-${index}`}
+-                    type="button"
+-                    className={`calendar-cell ${cell.inMonth ? '' : 'muted'} ${isSelected ? 'selected' : ''}`}
+-                    onDoubleClick={() => handleSelectCalendarDate(dateValue)}
+-                    onClick={() => handleSelectCalendarDate(dateValue)}
+-                  >
+-                    <span>{cell.date.getDate()}</span>
+-                    {hasAssignments ? <small>{assignments.filter((item) => item.dueDate === dateValue).length} chore(s)</small> : null}
+-                  </button>
+-                )
+-              })}
+-            </div>
+-          </div>
+-
+-          <div className="panel-card">
+-            <h2>Due on {formatDateLabel(selectedDate)}</h2>
+-            {selectedDateAssignments.length === 0 ? (
+-              <p className="muted">No chores scheduled for this day.</p>
+-            ) : (
+-              selectedDateAssignments.map((item) => (
+-                <div key={item.id} className="list-row stacked">
+-                  <div className="list-details">
+-                    <strong>{item.choreTitle}</strong>
+-                    <span>{item.userName}</span>
+-                    <span>{item.status}</span>
+-                  </div>
+-                  <div className="button-row">
+-                    <button type="button" onClick={() => handleStartAssignmentEdit(item)}>Edit</button>
+-                    <button type="button" onClick={() => handleDeleteAssignment(item.id)}>Delete</button>
+-                  </div>
+-                </div>
+-              ))
+-            )}
+-
+-            <div className="calendar-form">
+-              <label>
+-                Chore
+-                <select
+-                  value={selectedChoreId}
+-                  onChange={(event) => setSelectedChoreId(event.target.value === '' ? '' : Number(event.target.value))}
+-                >
+-                  {chores.map((chore) => (
+-                    <option key={chore.id} value={chore.id}>
+-                      {chore.title}
+-                    </option>
+-                  ))}
+-                </select>
+-              </label>
+-              <label>
+-                Assign to
+-                <select
+-                  value={selectedUserId}
+-                  onChange={(event) => setSelectedUserId(event.target.value === '' ? '' : Number(event.target.value))}
+-                >
+-                  {users.map((user) => (
+-                    <option key={user.id} value={user.id}>
+-                      {user.name}
+-                    </option>
+-                  ))}
+-                </select>
+-              </label>
+-              <label>
+-                Due date
+-                <input type="date" value={assignmentDate} onChange={(event) => setAssignmentDate(event.target.value)} />
+-              </label>
+-              <label>
+-                Status
+-                <select value={assignmentStatus} onChange={(event) => setAssignmentStatus(event.target.value as AssignmentStatus)}>
+-                  <option value="Pending">Pending</option>
+-                  <option value="In Progress">In Progress</option>
+-                  <option value="Done">Done</option>
+-                </select>
+-              </label>
+-              <button type="button" className="primary" onClick={handleAddAssignment}>Add chore for this date</button>
+-            </div>
++            </select>
++          </label>
++          <label>
++            Assigned to
++            <select value={userFilter} onChange={(event) => setUserFilter(Number(event.target.value))}>
++              <option value={0}>Everyone</option>
++              {users.map((user) => (
++                <option key={user.id} value={user.id}>
++                  {user.name}
++                </option>
++              ))}
++            </select>
++          </label>
++          <label>
++            Search
++            <input
++              value={query}
++              onChange={(event) => setQuery(event.target.value)}
++              placeholder="e.g. laundry"
++            />
++          </label>
++          {activeTab === 'chores' ? (
++            <label>
++              Sort by
++              <select value={sortBy} onChange={(event) => setSortBy(event.target.value)}>
++                {['Priority', 'Due date', 'Assigned user'].map((item) => (
++                  <option key={item} value={item}>
++                    {item}
++                  </option>
++                ))}
++              </select>
++            </label>
++          ) : null}
++
++          <div className="metrics">
++            <span>
++              <strong>{openCount}</strong> open
++            </span>
++            <span className="past-due">
++              <strong>{pastDue}</strong> past due
++            </span>
++            <span className="due-soon">
++              <strong>{dueSoon}</strong> due soon
++            </span>
++            <span className="completed">
++              <strong>{completed}</strong> done
++            </span>
+           </div>
+         </section>
+-      )}
++      ) : null}
+ 
+-      {activeTab === 'settings' && (
+-        <section className="panel">
+-            <div className="panel-card">
+-              <h2>Add chore</h2>
+-              <label>
+-                Chore title
+-                <input value={choreTitle} onChange={(event) => setChoreTitle(event.target.value)} placeholder="Enter a chore" />
+-              </label>
+-              <label>
+-                Description / instructions
+-                <textarea value={choreDescription} onChange={(event) => setChoreDescription(event.target.value)} rows={4} />
+-              </label>
+-              <label>
+-                Frequency
+-                <select value={frequency} onChange={(event) => setFrequency(event.target.value)}>
+-                  <option value="One-time">One-time</option>
+-                  <option value="Daily">Daily</option>
+-                  <option value="Weekly">Weekly</option>
+-                  <option value="Biweekly">Biweekly</option>
+-                  <option value="Monthly">Monthly</option>
+-                </select>
+-              </label>
+-              <button type="button" onClick={handleAddChore}>Add chore</button>
+-              <div className="list-card">
+-                {chores.map((chore) => (
+-                  <div key={chore.id} className="list-row">
+-                    {editingChoreId === chore.id ? (
+-                      <div className="inline-editor">
+-                        <input
+-                          value={editingChoreDraft.title}
+-                          onChange={(event) => setEditingChoreDraft((current) => ({ ...current, title: event.target.value }))}
+-                          placeholder="Chore title"
+-                        />
+-                        <textarea
+-                          value={editingChoreDraft.description}
+-                          onChange={(event) => setEditingChoreDraft((current) => ({ ...current, description: event.target.value }))}
+-                          rows={3}
+-                        />
+-                        <select
+-                          value={editingChoreDraft.frequency}
+-                          onChange={(event) => setEditingChoreDraft((current) => ({ ...current, frequency: event.target.value }))}
+-                        >
+-                          <option value="One-time">One-time</option>
+-                          <option value="Daily">Daily</option>
+-                          <option value="Weekly">Weekly</option>
+-                          <option value="Biweekly">Biweekly</option>
+-                          <option value="Monthly">Monthly</option>
+-                        </select>
+-                        <div className="button-row">
+-                          <button type="button" className="primary" onClick={() => handleSaveChoreEdit(chore.id)}>Save</button>
+-                          <button type="button" onClick={handleCancelChoreEdit}>Cancel</button>
+-                        </div>
+-                      </div>
+-                    ) : (
+-                      <>
+-                        <div className="list-details">
+-                          <strong>{chore.title}</strong>
+-                          <span>{chore.frequency}</span>
+-                        </div>
+-                        <div className="button-row">
+-                          <button type="button" onClick={() => handleStartChoreEdit(chore)}>Edit</button>
+-                          <button type="button" onClick={() => handleDeleteChore(chore.id)}>Delete</button>
+-                        </div>
+-                      </>
+-                    )}
+-                  </div>
+-                ))}
+-              </div>
+-            </div>
++      {activeTab === 'chores' ? (
++        <ChoreList
++          assignments={assignments}
++          chores={chores}
++          users={users}
++          onAssign={(choreId, userId, dueDate, priority) =>
++            void run(async () => {
++              const assignment = await api.assignChore(choreId, { userId, dueDate, priority })
++              return `Assigned ${assignment.choreTitle} to ${assignment.userName}`
++            })
++          }
++          onComplete={(id) =>
++            void run(async () => {
++              const result = await api.completeAssignment(id)
++              return `${result.assignment.choreTitle}: +${result.points} points`
++            })
++          }
++          onReopen={(id) =>
++            void run(async () => {
++              const result = await api.reopenAssignment(id)
++              return `Reopened — ${result.pointsRemoved} points removed`
++            })
++          }
++          onSave={(id, fields) =>
++            void run(async () => {
++              await api.updateAssignment(id, fields)
++              return 'Assignment updated'
++            })
++          }
++          onDelete={(id) =>
++            void run(async () => {
++              await api.deleteAssignment(id)
++              return 'Assignment deleted'
++            })
++          }
++          onMarkInProgress={(id) =>
++            void run(async () => {
++              await api.updateAssignment(id, { status: 'In Progress' })
++              return 'Marked in progress'
++            })
++          }
++        />
++      ) : null}
+ 
+-          <div className="panel-card">
+-            <h2>Add or update an assignment</h2>
+-            <div className="form-grid">
+-              <label>
+-                Chore
+-                <select
+-                  value={editingAssignmentId === null ? selectedChoreId : editingAssignmentDraft.choreId}
+-                  onChange={(event) => {
+-                    const nextValue = event.target.value === '' ? '' : Number(event.target.value)
+-                    if (editingAssignmentId === null) {
+-                      setSelectedChoreId(nextValue)
+-                    } else {
+-                      setEditingAssignmentDraft((current) => ({ ...current, choreId: Number(nextValue) }))
+-                    }
+-                  }}
+-                >
+-                  {chores.map((chore) => (
+-                    <option key={chore.id} value={chore.id}>
+-                      {chore.title}
+-                    </option>
+-                  ))}
+-                </select>
+-              </label>
+-              <label>
+-                Assign to
+-                <select
+-                  value={editingAssignmentId === null ? selectedUserId : editingAssignmentDraft.userId}
+-                  onChange={(event) => {
+-                    const nextValue = event.target.value === '' ? '' : Number(event.target.value)
+-                    if (editingAssignmentId === null) {
+-                      setSelectedUserId(nextValue)
+-                    } else {
+-                      setEditingAssignmentDraft((current) => ({ ...current, userId: Number(nextValue) }))
+-                    }
+-                  }}
+-                >
+-                  {users.map((user) => (
+-                    <option key={user.id} value={user.id}>
+-                      {user.name}
+-                    </option>
+-                  ))}
+-                </select>
+-              </label>
+-              <label>
+-                Due date
+-                <input
+-                  type="date"
+-                  value={editingAssignmentId === null ? assignmentDate : editingAssignmentDraft.dueDate}
+-                  onChange={(event) => {
+-                    const nextValue = event.target.value
+-                    if (editingAssignmentId === null) {
+-                      setAssignmentDate(nextValue)
+-                    } else {
+-                      setEditingAssignmentDraft((current) => ({ ...current, dueDate: nextValue }))
+-                    }
+-                  }}
+-                />
+-              </label>
+-              <label>
+-                Status
+-                <select
+-                  value={editingAssignmentId === null ? assignmentStatus : editingAssignmentDraft.status}
+-                  onChange={(event) => {
+-                    const nextValue = event.target.value as AssignmentStatus
+-                    if (editingAssignmentId === null) {
+-                      setAssignmentStatus(nextValue)
+-                    } else {
+-                      setEditingAssignmentDraft((current) => ({ ...current, status: nextValue }))
+-                    }
+-                  }}
+-                >
+-                  <option value="Pending">Pending</option>
+-                  <option value="In Progress">In Progress</option>
+-                  <option value="Done">Done</option>
+-                </select>
+-              </label>
+-              <label>
+-                Priority
+-                <select
+-                  value={editingAssignmentId === null ? assignmentPriority : editingAssignmentDraft.priority}
+-                  onChange={(event) => {
+-                    const nextValue = event.target.value as AssignmentPriority
+-                    if (editingAssignmentId === null) {
+-                      setAssignmentPriority(nextValue)
+-                    } else {
+-                      setEditingAssignmentDraft((current) => ({ ...current, priority: nextValue }))
+-                    }
+-                  }}
+-                >
+-                  <option value="Low">Low</option>
+-                  <option value="Normal">Normal</option>
+-                  <option value="High">High</option>
+-                </select>
+-              </label>
+-            </div>
+-            {editingAssignmentId === null ? (
+-              <button type="button" className="primary" onClick={handleAddAssignment}>Save assignment</button>
+-            ) : (
+-              <div className="button-row">
+-                <button type="button" className="primary" onClick={() => handleSaveAssignmentEdit(editingAssignmentId)}>Save changes</button>
+-                <button type="button" onClick={() => setEditingAssignmentId(null)}>Cancel</button>
+-              </div>
+-            )}
+-          </div>
+-        </section>
+-      )}
++      {activeTab === 'calendar' ? (
++        <Calendar
++          assignments={assignments}
++          chores={chores}
++          users={users}
++          onCreate={(body) =>
++            void run(async () => {
++              const assignment = await api.createAssignment(body)
++              return `Added ${assignment.choreTitle} for ${assignment.dueDate}`
++            })
++          }
++          onComplete={(id) =>
++            void run(async () => {
++              const result = await api.completeAssignment(id)
++              return `${result.assignment.choreTitle}: +${result.points} points`
++            })
++          }
++          onReopen={(id) =>
++            void run(async () => {
++              const result = await api.reopenAssignment(id)
++              return `Reopened — ${result.pointsRemoved} points removed`
++            })
++          }
++          onDelete={(id) =>
++            void run(async () => {
++              await api.deleteAssignment(id)
++              return 'Assignment deleted'
++            })
++          }
++        />
++      ) : null}
++
++      {activeTab === 'settings' ? (
++        <Settings
++          chores={chores}
++          users={users}
++          history={history}
++          onCreateChore={(body) =>
++            void run(async () => {
++              const chore = await api.createChore(body)
++              return `Added ${chore.title}`
++            })
++          }
++          onUpdateChore={(id, body) =>
++            void run(async () => {
++              await api.updateChore(id, body)
++              return 'Chore updated'
++            })
++          }
++          onDeleteChore={(id) =>
++            void run(async () => {
++              await api.deleteChore(id)
++              return 'Chore deleted'
++            })
++          }
++          onCreateUser={(body) =>
++            void run(async () => {
++              const user = await api.createUser(body)
++              return `Added ${user.name}`
++            })
++          }
++          onDeleteUser={(id) =>
++            void run(async () => {
++              await api.deleteUser(id)
++              return 'Person deleted'
++            })
++          }
++        />
++      ) : null}
+     </div>
+   )
+ }
+diff --git a/src/api.ts b/src/api.ts
+new file mode 100644
+index 0000000..536d493
+--- /dev/null
++++ b/src/api.ts
+@@ -0,0 +1,167 @@
++/**
++ * Client for the PHP API in lib/Controller, routed by appinfo/routes.php.
++ *
++ * Under Nextcloud the same routes live beneath the app's base URL, so only
++ * API_BASE has to change.
++ */
++
++const API_BASE = '/api'
++
++export type AssignmentStatus = 'Pending' | 'In Progress' | 'Done'
++export type Priority = 'High' | 'Medium' | 'Low'
++export type DueState = 'Past due' | 'Due soon' | 'Upcoming' | 'Completed'
++
++export type User = {
++  id: number
++  name: string
++  email: string | null
++}
++
++export type RewardTier = {
++  slug: string
++  title: string
++  description: string
++  threshold: number
++}
++
++export type UserProgress = {
++  id: number
++  name: string
++  points: number
++  completed: number
++  openChores: number
++  tier: string | null
++  nextTier: RewardTier | null
++  progress: number
++}
++
++export type Chore = {
++  id: number
++  title: string
++  description: string
++  frequency: string
++  lastCompleted: string | null
++  openAssignments: number
++  scheduledDue: string
++  dueState: DueState
++  suggestedPriority: Priority
++}
++
++export type Assignment = {
++  id: number
++  choreId: number
++  userId: number
++  choreTitle: string
++  description: string
++  frequency: string
++  userName: string
++  email: string | null
++  dueDate: string
++  status: AssignmentStatus
++  priority: Priority
++  lastUpdate: string | null
++  completedAt: string | null
++  choreLastCompleted: string | null
++  pointsAwarded: number
++  scheduledDue: string
++  dueState: DueState
++  suggestedPriority: Priority
++  pointsIfCompletedToday: number
++}
++
++export type Notification = {
++  id: number
++  message: string
++  read: boolean
++  createdAt: string
++  assignmentId: number | null
++  userName: string | null
++}
++
++export type PointsEntry = {
++  points: number
++  reason: string
++  createdAt: string
++  user: string
++}
++
++async function request<T>(path: string, init?: RequestInit): Promise<T> {
++  const response = await fetch(`${API_BASE}${path}`, {
++    headers: { 'Content-Type': 'application/json' },
++    ...init,
++  })
++
++  const payload = await response.json().catch(() => null)
++  if (!response.ok) {
++    throw new Error(payload?.error ?? `Request failed with status ${response.status}`)
++  }
++  return payload as T
++}
++
++const send = <T>(method: string, path: string, body?: unknown) =>
++  request<T>(path, { method, body: body === undefined ? undefined : JSON.stringify(body) })
++
++export const api = {
++  chores: () => request<{ chores: Chore[] }>('/chores').then((r) => r.chores),
++
++  createChore: (body: { title: string; description: string; frequency: string }) =>
++    send<{ chore: Chore }>('POST', '/chores', body).then((r) => r.chore),
++
++  updateChore: (id: number, body: Partial<{ title: string; description: string; frequency: string }>) =>
++    send<{ chore: Chore }>('PUT', `/chores/${id}`, body).then((r) => r.chore),
++
++  deleteChore: (id: number) => send<{ deleted: boolean }>('DELETE', `/chores/${id}`),
++
++  assignChore: (id: number, body: { userId: number; dueDate?: string; priority?: Priority }) =>
++    send<{ assignment: Assignment }>('POST', `/chores/${id}/assign`, body).then((r) => r.assignment),
++
++  assignments: (params: { status?: string; userId?: number; query?: string; sortBy?: string } = {}) => {
++    const search = new URLSearchParams()
++    for (const [key, value] of Object.entries(params)) {
++      if (value !== undefined && value !== '' && value !== 0) search.set(key, String(value))
++    }
++    const suffix = search.toString() ? `?${search}` : ''
++    return request<{ assignments: Assignment[] }>(`/assignments${suffix}`).then((r) => r.assignments)
++  },
++
++  createAssignment: (body: {
++    choreId: number
++    userId: number
++    dueDate: string
++    priority?: Priority
++    status?: AssignmentStatus
++  }) => send<{ assignment: Assignment }>('POST', '/assignments', body).then((r) => r.assignment),
++
++  updateAssignment: (
++    id: number,
++    body: Partial<{
++      choreId: number
++      userId: number
++      dueDate: string
++      priority: Priority
++      status: AssignmentStatus
++    }>,
++  ) => send<{ assignment: Assignment }>('PUT', `/assignments/${id}`, body).then((r) => r.assignment),
++
++  deleteAssignment: (id: number) => send<{ deleted: boolean }>('DELETE', `/assignments/${id}`),
++
++  completeAssignment: (id: number) =>
++    send<{ assignment: Assignment; points: number }>('POST', `/assignments/${id}/complete`),
++
++  reopenAssignment: (id: number) =>
++    send<{ assignment: Assignment; pointsRemoved: number }>('POST', `/assignments/${id}/reopen`),
++
++  users: () => request<{ users: User[] }>('/users').then((r) => r.users),
++
++  createUser: (body: { name: string; email?: string }) =>
++    send<{ user: User }>('POST', '/users', body).then((r) => r.user),
++
++  deleteUser: (id: number) => send<{ deleted: boolean }>('DELETE', `/users/${id}`),
++
++  progress: () => request<{ progress: UserProgress[]; history: PointsEntry[] }>('/users/progress'),
++
++  notifications: () =>
++    request<{ notifications: Notification[]; unread: number }>('/notifications'),
++
++  markNotificationsRead: () => send<{ unread: number }>('POST', '/notifications/read'),
++}
+diff --git a/src/components/Calendar.tsx b/src/components/Calendar.tsx
+new file mode 100644
+index 0000000..a9742ba
+--- /dev/null
++++ b/src/components/Calendar.tsx
+@@ -0,0 +1,220 @@
++/** Month grid of chores by due date — port of components/calendar/calendar.jsx. */
++
++import { useMemo, useState } from 'react'
++import type { Assignment, Chore, Priority, User } from '../api'
++
++const DUE_STATE_CLASS: Record<string, string> = {
++  'Past due': 'past-due',
++  'Due soon': 'due-soon',
++  Upcoming: 'upcoming',
++  Completed: 'completed',
++}
++
++function toDateKey(date: Date) {
++  const month = `${date.getMonth() + 1}`.padStart(2, '0')
++  const day = `${date.getDate()}`.padStart(2, '0')
++  return `${date.getFullYear()}-${month}-${day}`
++}
++
++/** The month grid, padded out to whole Monday-start weeks. */
++function monthCells(viewMonth: Date) {
++  const year = viewMonth.getFullYear()
++  const month = viewMonth.getMonth()
++  const leadingBlanks = (new Date(year, month, 1).getDay() + 6) % 7
++  const daysInMonth = new Date(year, month + 1, 0).getDate()
++
++  const cells: Array<{ date: Date; inMonth: boolean }> = []
++  for (let index = 0; index < leadingBlanks; index += 1) {
++    cells.push({ date: new Date(year, month, index - leadingBlanks + 1), inMonth: false })
++  }
++  for (let day = 1; day <= daysInMonth; day += 1) {
++    cells.push({ date: new Date(year, month, day), inMonth: true })
++  }
++  while (cells.length % 7 !== 0) {
++    const last = cells[cells.length - 1].date
++    cells.push({
++      date: new Date(last.getFullYear(), last.getMonth(), last.getDate() + 1),
++      inMonth: false,
++    })
++  }
++  return cells
++}
++
++type Props = {
++  assignments: Assignment[]
++  chores: Chore[]
++  users: User[]
++  onCreate: (body: { choreId: number; userId: number; dueDate: string; priority: Priority }) => void
++  onComplete: (id: number) => void
++  onReopen: (id: number) => void
++  onDelete: (id: number) => void
++}
++
++export default function Calendar({
++  assignments,
++  chores,
++  users,
++  onCreate,
++  onComplete,
++  onReopen,
++  onDelete,
++}: Props) {
++  const today = toDateKey(new Date())
++  const [viewMonth, setViewMonth] = useState(new Date())
++  const [selectedDate, setSelectedDate] = useState(today)
++  const [choreId, setChoreId] = useState<number>(chores[0]?.id ?? 0)
++  const [userId, setUserId] = useState<number>(users[0]?.id ?? 0)
++  const [priority, setPriority] = useState<Priority>('Medium')
++
++  const cells = useMemo(() => monthCells(viewMonth), [viewMonth])
++
++  const byDay = useMemo(() => {
++    const map = new Map<string, Assignment[]>()
++    for (const item of assignments) {
++      const bucket = map.get(item.dueDate)
++      if (bucket) bucket.push(item)
++      else map.set(item.dueDate, [item])
++    }
++    return map
++  }, [assignments])
++
++  const selectedAssignments = byDay.get(selectedDate) ?? []
++  const shiftMonth = (delta: number) =>
++    setViewMonth(new Date(viewMonth.getFullYear(), viewMonth.getMonth() + delta, 1))
++
++  return (
++    <div className="calendar-layout">
++      <section className="panel-card calendar-card">
++        <div className="calendar-header">
++          <button type="button" onClick={() => shiftMonth(-1)}>
++            ← Prev
++          </button>
++          <h2>{viewMonth.toLocaleDateString(undefined, { month: 'long', year: 'numeric' })}</h2>
++          <div className="button-row">
++            <button type="button" onClick={() => setViewMonth(new Date())}>
++              Today
++            </button>
++            <button type="button" onClick={() => shiftMonth(1)}>
++              Next →
++            </button>
++          </div>
++        </div>
++
++        <div className="calendar-grid">
++          {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((day) => (
++            <div key={day} className="calendar-day-label">
++              {day}
++            </div>
++          ))}
++
++          {cells.map((cell) => {
++            const key = toDateKey(cell.date)
++            const entries = byDay.get(key) ?? []
++            const classes = [
++              'calendar-cell',
++              cell.inMonth ? '' : 'outside',
++              key === selectedDate ? 'selected' : '',
++              key === today ? 'today' : '',
++            ]
++
++            return (
++              <button
++                key={key}
++                type="button"
++                className={classes.join(' ')}
++                onClick={() => setSelectedDate(key)}
++              >
++                <span className="calendar-date">{cell.date.getDate()}</span>
++                {entries.slice(0, 2).map((item) => (
++                  <span key={item.id} className={`calendar-chip ${DUE_STATE_CLASS[item.dueState]}`}>
++                    {item.choreTitle}
++                  </span>
++                ))}
++                {entries.length > 2 ? <small>+{entries.length - 2} more</small> : null}
++              </button>
++            )
++          })}
++        </div>
++
++        <p className="calendar-legend">
++          <span className="past-due">● past due</span> <span className="due-soon">● due soon</span>{' '}
++          <span className="upcoming">● upcoming</span> <span className="completed">● completed</span>
++        </p>
++      </section>
++
++      <section className="panel-card">
++        <h2>Due on {selectedDate}</h2>
++
++        {selectedAssignments.length === 0 ? (
++          <p className="muted">No chores scheduled for this day.</p>
++        ) : (
++          selectedAssignments.map((item) => (
++            <div key={item.id} className="list-row">
++              <div className="list-details">
++                <strong>{item.choreTitle}</strong>
++                <span>
++                  👤 {item.userName} · {item.priority} priority · {item.frequency}
++                </span>
++                <span className={DUE_STATE_CLASS[item.dueState]}>{item.dueState}</span>
++              </div>
++              <div className="button-row">
++                {item.status === 'Done' ? (
++                  <button type="button" onClick={() => onReopen(item.id)}>
++                    Reopen
++                  </button>
++                ) : (
++                  <button type="button" className="primary" onClick={() => onComplete(item.id)}>
++                    Done
++                  </button>
++                )}
++                <button type="button" className="danger" onClick={() => onDelete(item.id)}>
++                  Delete
++                </button>
++              </div>
++            </div>
++          ))
++        )}
++
++        <div className="calendar-form">
++          <h3>Add a chore to this day</h3>
++          <label>
++            Chore
++            <select value={choreId} onChange={(event) => setChoreId(Number(event.target.value))}>
++              {chores.map((chore) => (
++                <option key={chore.id} value={chore.id}>
++                  {chore.title}
++                </option>
++              ))}
++            </select>
++          </label>
++          <label>
++            Assign to
++            <select value={userId} onChange={(event) => setUserId(Number(event.target.value))}>
++              {users.map((user) => (
++                <option key={user.id} value={user.id}>
++                  {user.name}
++                </option>
++              ))}
++            </select>
++          </label>
++          <label>
++            Priority
++            <select value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>
++              <option value="High">High</option>
++              <option value="Medium">Medium</option>
++              <option value="Low">Low</option>
++            </select>
++          </label>
++          <button
++            type="button"
++            className="primary"
++            disabled={choreId === 0 || userId === 0}
++            onClick={() => onCreate({ choreId, userId, dueDate: selectedDate, priority })}
++          >
++            Add for {selectedDate}
++          </button>
++        </div>
++      </section>
++    </div>
++  )
++}
+diff --git a/src/components/ChoreDetails.tsx b/src/components/ChoreDetails.tsx
+new file mode 100644
+index 0000000..44f52d6
+--- /dev/null
++++ b/src/components/ChoreDetails.tsx
+@@ -0,0 +1,131 @@
++/** Expanded detail panel for one assignment — port of components/chores/chore_details.jsx. */
++
++import { useState } from 'react'
++import type { Assignment, Priority, User } from '../api'
++
++const PRIORITIES: Priority[] = ['High', 'Medium', 'Low']
++
++/**
++ * Older rows carry priorities the picker does not offer ('Normal'). Keeping the
++ * stored value in the list stops the select falling back to its first option and
++ * silently rewriting the priority on save.
++ */
++function priorityOptions(current: Priority): Priority[] {
++  return PRIORITIES.includes(current) ? PRIORITIES : [...PRIORITIES, current]
++}
++
++type Props = {
++  assignment: Assignment
++  users: User[]
++  onSave: (fields: { dueDate: string; priority: Priority; userId: number }) => void
++  onDelete: () => void
++  onMarkInProgress: () => void
++}
++
++export default function ChoreDetails({
++  assignment,
++  users,
++  onSave,
++  onDelete,
++  onMarkInProgress,
++}: Props) {
++  const [dueDate, setDueDate] = useState(assignment.dueDate)
++  const [priority, setPriority] = useState<Priority>(assignment.priority)
++  const [userId, setUserId] = useState(assignment.userId)
++
++  const done = assignment.status === 'Done'
++  const offSchedule = !done && assignment.dueDate !== assignment.scheduledDue
++
++  return (
++    <div className="chore-details">
++      <div className="detail-grid">
++        <dl>
++          <dt>Description</dt>
++          <dd>{assignment.description || '—'}</dd>
++          <dt>Frequency</dt>
++          <dd>{assignment.frequency}</dd>
++          <dt>Assigned to</dt>
++          <dd>
++            {assignment.userName} ({assignment.email ?? 'no email'})
++          </dd>
++          <dt>Status</dt>
++          <dd>{assignment.status}</dd>
++        </dl>
++        <dl>
++          {/* The previous time this chore was done, not counting this assignment. */}
++          <dt>Previously done</dt>
++          <dd>{assignment.choreLastCompleted?.slice(0, 16) ?? 'Never'}</dd>
++          <dt>Scheduled due</dt>
++          <dd>
++            {assignment.scheduledDue}
++            {offSchedule ? ' (this one is set differently)' : ''}
++          </dd>
++          {done ? (
++            <>
++              <dt>Points earned</dt>
++              <dd>{assignment.pointsAwarded}</dd>
++              <dt>Completed at</dt>
++              <dd>{assignment.completedAt?.slice(0, 16) ?? '—'}</dd>
++            </>
++          ) : (
++            <>
++              <dt>Worth</dt>
++              <dd>{assignment.pointsIfCompletedToday} points if completed today</dd>
++              <dt>Latest update</dt>
++              <dd>{assignment.lastUpdate ?? '—'}</dd>
++            </>
++          )}
++        </dl>
++      </div>
++
++      <div className="detail-editor">
++        <label>
++          Due date
++          <input type="date" value={dueDate} onChange={(event) => setDueDate(event.target.value)} />
++        </label>
++        <label>
++          Priority
++          <select value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>
++            {priorityOptions(assignment.priority).map((item) => (
++              <option key={item} value={item}>
++                {item}
++              </option>
++            ))}
++          </select>
++        </label>
++        <label>
++          Assigned to
++          <select value={userId} onChange={(event) => setUserId(Number(event.target.value))}>
++            {users.map((user) => (
++              <option key={user.id} value={user.id}>
++                {user.name}
++              </option>
++            ))}
++          </select>
++        </label>
++      </div>
++
++      <div className="button-row">
++        <button type="button" className="primary" onClick={() => onSave({ dueDate, priority, userId })}>
++          Save
++        </button>
++        {offSchedule ? (
++          <button
++            type="button"
++            onClick={() => onSave({ dueDate: assignment.scheduledDue, priority, userId })}
++          >
++            Use schedule ({assignment.scheduledDue})
++          </button>
++        ) : null}
++        {!done ? (
++          <button type="button" onClick={onMarkInProgress}>
++            Mark in progress
++          </button>
++        ) : null}
++        <button type="button" className="danger" onClick={onDelete}>
++          Delete
++        </button>
++      </div>
++    </div>
++  )
++}
+diff --git a/src/components/ChoreList.tsx b/src/components/ChoreList.tsx
+new file mode 100644
+index 0000000..18345a8
+--- /dev/null
++++ b/src/components/ChoreList.tsx
+@@ -0,0 +1,191 @@
++/** Chore list — port of components/chores/chore_list.jsx. */
++
++import { useState } from 'react'
++import type { Assignment, Chore, Priority, User } from '../api'
++import ChoreDetails from './ChoreDetails'
++
++const DUE_STATE_ICON: Record<string, string> = {
++  'Past due': '🚨',
++  'Due soon': '⏰',
++  Upcoming: '🗓️',
++  Completed: '✅',
++}
++
++const PRIORITY_ICON: Record<string, string> = {
++  high: '🔴',
++  medium: '🟠',
++  normal: '🟠',
++  low: '🟢',
++}
++
++type Props = {
++  assignments: Assignment[]
++  chores: Chore[]
++  users: User[]
++  onAssign: (choreId: number, userId: number, dueDate: string, priority: Priority) => void
++  onComplete: (id: number) => void
++  onReopen: (id: number) => void
++  onSave: (id: number, fields: { dueDate: string; priority: Priority; userId: number }) => void
++  onDelete: (id: number) => void
++  onMarkInProgress: (id: number) => void
++}
++
++/** The '+' popover: assign a chore, with the due date and priority prefilled. */
++function AssignForm({
++  chore,
++  users,
++  onAssign,
++}: {
++  chore: Chore
++  users: User[]
++  onAssign: Props['onAssign']
++}) {
++  const [open, setOpen] = useState(false)
++  const [userId, setUserId] = useState(users[0]?.id ?? 0)
++  const [dueDate, setDueDate] = useState(chore.scheduledDue)
++  const [priority, setPriority] = useState<Priority>(chore.suggestedPriority)
++
++  if (!open) {
++    return (
++      <button type="button" className="assign-toggle" onClick={() => setOpen(true)} title="Assign">
++        ➕
++      </button>
++    )
++  }
++
++  return (
++    <div className="assign-form">
++      <select value={userId} onChange={(event) => setUserId(Number(event.target.value))}>
++        {users.map((user) => (
++          <option key={user.id} value={user.id}>
++            {user.name}
++          </option>
++        ))}
++      </select>
++      <input type="date" value={dueDate} onChange={(event) => setDueDate(event.target.value)} />
++      <select value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>
++        <option value="High">High</option>
++        <option value="Medium">Medium</option>
++        <option value="Low">Low</option>
++      </select>
++      <div className="button-row">
++        <button
++          type="button"
++          className="primary"
++          onClick={() => {
++            onAssign(chore.id, userId, dueDate, priority)
++            setOpen(false)
++          }}
++        >
++          Assign
++        </button>
++        <button type="button" onClick={() => setOpen(false)}>
++          Cancel
++        </button>
++      </div>
++    </div>
++  )
++}
++
++export default function ChoreList({
++  assignments,
++  chores,
++  users,
++  onAssign,
++  onComplete,
++  onReopen,
++  onSave,
++  onDelete,
++  onMarkInProgress,
++}: Props) {
++  const [expandedId, setExpandedId] = useState<number | null>(null)
++  const unassigned = chores.filter((chore) => chore.openAssignments === 0)
++
++  return (
++    <>
++      {unassigned.length > 0 && users.length > 0 ? (
++        <section className="panel-card">
++          <h2>Available chores</h2>
++          <p className="muted">Nobody is on these yet. Use ➕ to assign one.</p>
++
++          {unassigned.map((chore) => (
++            <div key={chore.id} className="list-row">
++              <div className="list-details">
++                <strong>{chore.title}</strong>
++                <span>
++                  {chore.frequency} ·{' '}
++                  {chore.lastCompleted ? `last done ${chore.lastCompleted.slice(0, 10)}` : 'never done'}
++                </span>
++                <span>
++                  {DUE_STATE_ICON[chore.dueState]} due {chore.scheduledDue} ·{' '}
++                  {PRIORITY_ICON[chore.suggestedPriority.toLowerCase()]} {chore.suggestedPriority}
++                </span>
++              </div>
++              <AssignForm chore={chore} users={users} onAssign={onAssign} />
++            </div>
++          ))}
++        </section>
++      ) : null}
++
++      <section className="panel-card">
++        <h2>Chore list</h2>
++        {assignments.length === 0 ? (
++          <p className="muted">No chores match these filters.</p>
++        ) : (
++          assignments.map((item) => {
++            const done = item.status === 'Done'
++            const expanded = expandedId === item.id
++
++            return (
++              <div key={item.id} className={`list-row assignment ${done ? 'done' : ''}`}>
++                <div className="assignment-head">
++                  <div className="list-details">
++                    <strong>
++                      {DUE_STATE_ICON[item.dueState]} {done ? <s>{item.choreTitle}</s> : item.choreTitle}
++                    </strong>
++                    <span>
++                      👤 {item.userName} · {item.frequency}
++                    </span>
++                    <span>
++                      📅 {item.dueDate} · {item.dueState} ·{' '}
++                      {PRIORITY_ICON[item.priority.toLowerCase()] ?? '⚪'} {item.priority}
++                      {done ? ` · +${item.pointsAwarded} pts` : ` · worth ${item.pointsIfCompletedToday} pts`}
++                    </span>
++                  </div>
++
++                  <div className="button-row">
++                    {done ? (
++                      <button type="button" onClick={() => onReopen(item.id)}>
++                        Reopen
++                      </button>
++                    ) : (
++                      <button type="button" className="primary" onClick={() => onComplete(item.id)}>
++                        Done
++                      </button>
++                    )}
++                    <button type="button" onClick={() => setExpandedId(expanded ? null : item.id)}>
++                      {expanded ? 'Hide' : 'Details'}
++                    </button>
++                  </div>
++                </div>
++
++                {expanded ? (
++                  <ChoreDetails
++                    assignment={item}
++                    users={users}
++                    onSave={(fields) => onSave(item.id, fields)}
++                    onDelete={() => {
++                      onDelete(item.id)
++                      setExpandedId(null)
++                    }}
++                    onMarkInProgress={() => onMarkInProgress(item.id)}
++                  />
++                ) : null}
++              </div>
++            )
++          })
++        )}
++      </section>
++    </>
++  )
++}
+diff --git a/src/components/NotificationBell.tsx b/src/components/NotificationBell.tsx
+new file mode 100644
+index 0000000..98e4036
+--- /dev/null
++++ b/src/components/NotificationBell.tsx
+@@ -0,0 +1,60 @@
++/** Notification bell — port of components/users/notify_user.jsx. */
++
++import { useEffect, useRef, useState } from 'react'
++import type { Notification } from '../api'
++
++type Props = {
++  notifications: Notification[]
++  unread: number
++  onMarkRead: () => void
++}
++
++export default function NotificationBell({ notifications, unread, onMarkRead }: Props) {
++  const [open, setOpen] = useState(false)
++  const container = useRef<HTMLDivElement>(null)
++
++  useEffect(() => {
++    if (!open) return
++
++    const closeOnOutsideClick = (event: MouseEvent) => {
++      if (!container.current?.contains(event.target as Node)) setOpen(false)
++    }
++    document.addEventListener('mousedown', closeOnOutsideClick)
++    return () => document.removeEventListener('mousedown', closeOnOutsideClick)
++  }, [open])
++
++  return (
++    <div className="bell" ref={container}>
++      <button type="button" className="bell-button" onClick={() => setOpen((value) => !value)}>
++        🔔
++        {unread > 0 ? <span className="bell-badge">{unread}</span> : null}
++      </button>
++
++      {open ? (
++        <div className="bell-dropdown">
++          <div className="bell-header">
++            <strong>Notifications</strong>
++            {unread > 0 ? (
++              <button type="button" onClick={onMarkRead}>
++                Mark all read
++              </button>
++            ) : null}
++          </div>
++
++          {notifications.length === 0 ? (
++            <p className="muted">Nothing yet. Assign or complete a chore.</p>
++          ) : (
++            <ul className="bell-list">
++              {notifications.map((note) => (
++                <li key={note.id} className={note.read ? 'read' : 'unread'}>
++                  <span>{note.message}</span>
++                  <small>{note.createdAt}</small>
++                </li>
++              ))}
++            </ul>
++          )}
++        </div>
++      ) : null}
++    </div>
++  )
++}
+diff --git a/src/components/PointBar.tsx b/src/components/PointBar.tsx
+new file mode 100644
+index 0000000..7f90680
+--- /dev/null
++++ b/src/components/PointBar.tsx
+@@ -0,0 +1,79 @@
++/** Point bars — port of components/points/PointHelpers.jsx. */
++
++import { useEffect, useRef, useState } from 'react'
++import type { UserProgress } from '../api'
++
++// PointHelpers sets the bar width straight from the point total (`${points}%`),
++// so 100 points is a full bar.
++const BAR_FULL_POINTS = 100
++
++function barWidth(points: number) {
++  return Math.max(0, Math.min(points, BAR_FULL_POINTS))
++}
++
++/**
++ * addPointsAnimation / removePointsAnimation: the bar flashes green when points
++ * arrive and red when they are taken back, then settles to its normal colour.
++ */
++function useDelta(points: number) {
++  const previous = useRef(points)
++  const [delta, setDelta] = useState(0)
++
++  useEffect(() => {
++    if (previous.current === points) return
++
++    setDelta(points - previous.current)
++    previous.current = points
++    const timer = window.setTimeout(() => setDelta(0), 900)
++    return () => window.clearTimeout(timer)
++  }, [points])
++
++  return delta
++}
++
++function UserBar({ user }: { user: UserProgress }) {
++  const delta = useDelta(user.points)
++  const flash = delta > 0 ? 'up' : delta < 0 ? 'down' : ''
++
++  const goal = user.nextTier
++    ? `${user.completed}/${user.nextTier.threshold} chores → ${user.nextTier.title}`
++    : `${user.completed} chores — all rewards earned 🏆`
++
++  return (
++    <div className="point-row">
++      <div className="point-name">
++        {user.name}
++        {delta !== 0 ? (
++          <span className={`point-delta ${flash}`}>
++            {delta > 0 ? '+' : ''}
++            {delta}
++          </span>
++        ) : null}
++        <span className="point-tier">{user.tier ?? 'No reward yet'}</span>
++      </div>
++      <div>
++        <div className="point-track">
++          <div className={`point-fill ${flash}`} style={{ width: `${barWidth(user.points)}%` }}>
++            {user.points} points
++          </div>
++        </div>
++        <span className="point-goal">{goal}</span>
++      </div>
++    </div>
++  )
++}
++
++export default function PointBar({ progress }: { progress: UserProgress[] }) {
++  if (progress.length === 0) return null
++
++  return (
++    <section className="point-card">
++      <h2>🏅 Points</h2>
++      <div className="point-grid">
++        {progress.map((user) => (
++          <UserBar key={user.id} user={user} />
++        ))}
++      </div>
++    </section>
++  )
++}
+diff --git a/src/components/Settings.tsx b/src/components/Settings.tsx
+new file mode 100644
+index 0000000..6b5fc88
+--- /dev/null
++++ b/src/components/Settings.tsx
+@@ -0,0 +1,210 @@
++/** Managing the chore catalogue and the people it can be assigned to. */
++
++import { useState } from 'react'
++import type { Chore, PointsEntry, User } from '../api'
++
++const FREQUENCIES = ['One-time', 'Daily', 'Weekly', 'Biweekly', 'Monthly']
++
++type Props = {
++  chores: Chore[]
++  users: User[]
++  history: PointsEntry[]
++  onCreateChore: (body: { title: string; description: string; frequency: string }) => void
++  onUpdateChore: (id: number, body: { title: string; description: string; frequency: string }) => void
++  onDeleteChore: (id: number) => void
++  onCreateUser: (body: { name: string; email?: string }) => void
++  onDeleteUser: (id: number) => void
++}
++
++export default function Settings({
++  chores,
++  users,
++  history,
++  onCreateChore,
++  onUpdateChore,
++  onDeleteChore,
++  onCreateUser,
++  onDeleteUser,
++}: Props) {
++  const [title, setTitle] = useState('')
++  const [description, setDescription] = useState('')
++  const [frequency, setFrequency] = useState('Weekly')
++
++  const [editingId, setEditingId] = useState<number | null>(null)
++  const [draft, setDraft] = useState({ title: '', description: '', frequency: 'Weekly' })
++
++  const [userName, setUserName] = useState('')
++  const [userEmail, setUserEmail] = useState('')
++
++  const submitChore = () => {
++    if (!title.trim()) return
++    onCreateChore({ title: title.trim(), description: description.trim(), frequency })
++    setTitle('')
++    setDescription('')
++    setFrequency('Weekly')
++  }
++
++  const submitUser = () => {
++    if (!userName.trim()) return
++    onCreateUser({ name: userName.trim(), email: userEmail.trim() || undefined })
++    setUserName('')
++    setUserEmail('')
++  }
++
++  return (
++    <div className="panel-grid">
++      <section className="panel-card">
++        <h2>Chores</h2>
++        <label>
++          Title
++          <input
++            value={title}
++            onChange={(event) => setTitle(event.target.value)}
++            placeholder="e.g. Vacuum"
++          />
++        </label>
++        <label>
++          Description
++          <textarea
++            value={description}
++            onChange={(event) => setDescription(event.target.value)}
++            rows={3}
++          />
++        </label>
++        <label>
++          Frequency
++          <select value={frequency} onChange={(event) => setFrequency(event.target.value)}>
++            {FREQUENCIES.map((item) => (
++              <option key={item} value={item}>
++                {item}
++              </option>
++            ))}
++          </select>
++        </label>
++        <button type="button" className="primary" onClick={submitChore}>
++          Add chore
++        </button>
++
++        <div className="list-card">
++          {chores.map((chore) => (
++            <div key={chore.id} className="list-row">
++              {editingId === chore.id ? (
++                <div className="inline-editor">
++                  <input
++                    value={draft.title}
++                    onChange={(event) => setDraft({ ...draft, title: event.target.value })}
++                  />
++                  <textarea
++                    value={draft.description}
++                    rows={2}
++                    onChange={(event) => setDraft({ ...draft, description: event.target.value })}
++                  />
++                  <select
++                    value={draft.frequency}
++                    onChange={(event) => setDraft({ ...draft, frequency: event.target.value })}
++                  >
++                    {FREQUENCIES.map((item) => (
++                      <option key={item} value={item}>
++                        {item}
++                      </option>
++                    ))}
++                  </select>
++                  <div className="button-row">
++                    <button
++                      type="button"
++                      className="primary"
++                      onClick={() => {
++                        onUpdateChore(chore.id, draft)
++                        setEditingId(null)
++                      }}
++                    >
++                      Save
++                    </button>
++                    <button type="button" onClick={() => setEditingId(null)}>
++                      Cancel
++                    </button>
++                  </div>
++                </div>
++              ) : (
++                <>
++                  <div className="list-details">
++                    <strong>{chore.title}</strong>
++                    <span>{chore.frequency}</span>
++                    {chore.description ? <small>{chore.description}</small> : null}
++                  </div>
++                  <div className="button-row">
++                    <button
++                      type="button"
++                      onClick={() => {
++                        setEditingId(chore.id)
++                        setDraft({
++                          title: chore.title,
++                          description: chore.description,
++                          frequency: chore.frequency,
++                        })
++                      }}
++                    >
++                      Edit
++                    </button>
++                    <button type="button" className="danger" onClick={() => onDeleteChore(chore.id)}>
++                      Delete
++                    </button>
++                  </div>
++                </>
++              )}
++            </div>
++          ))}
++        </div>
++      </section>
++
++      <section className="panel-card">
++        <h2>People</h2>
++        <label>
++          Name
++          <input value={userName} onChange={(event) => setUserName(event.target.value)} />
++        </label>
++        <label>
++          Email
++          <input
++            type="email"
++            value={userEmail}
++            onChange={(event) => setUserEmail(event.target.value)}
++          />
++        </label>
++        <button type="button" className="primary" onClick={submitUser}>
++          Add person
++        </button>
++
++        <div className="list-card">
++          {users.map((user) => (
++            <div key={user.id} className="list-row">
++              <div className="list-details">
++                <strong>{user.name}</strong>
++                <span>{user.email ?? 'no email'}</span>
++              </div>
++              <button type="button" className="danger" onClick={() => onDeleteUser(user.id)}>
++                Delete
++              </button>
++            </div>
++          ))}
++        </div>
++
++        <h3>Recent points</h3>
++        {history.length === 0 ? (
++          <p className="muted">No points awarded yet.</p>
++        ) : (
++          <div className="list-card">
++            {history.slice(0, 10).map((entry, index) => (
++              <div key={`${entry.createdAt}-${index}`} className="list-row compact">
++                <span>
++                  <strong>{entry.user}</strong> · {entry.reason}
++                </span>
++                <span className="points-badge">+{entry.points}</span>
++              </div>
++            ))}
++          </div>
++        )}
++      </section>
++    </div>
++  )
++}
+diff --git a/src/main.tsx b/src/main.tsx
+index bef5202..b78c6c5 100644
+--- a/src/main.tsx
++++ b/src/main.tsx
+@@ -3,8 +3,13 @@ import { createRoot } from 'react-dom/client'
+ import './index.css'
+ import App from './App.tsx'
+ 
+-createRoot(document.getElementById('root')!).render(
+-  <StrictMode>
+-    <App />
+-  </StrictMode>,
+-)
++// #root is Vite's index.html; #chore-app is the Nextcloud template in templates/main.php.
++const container = document.getElementById('root') ?? document.getElementById('chore-app')
++
++if (container) {
++  createRoot(container).render(
++    <StrictMode>
++      <App />
++    </StrictMode>,
++  )
++}
+diff --git a/templates/main.php b/templates/main.php
+index 87d7344..bc053e4 100644
+--- a/templates/main.php
++++ b/templates/main.php
+@@ -1,2 +1,3 @@
+ <div id="chore-app"></div>
+-<script src="<?php print_unescaped(\OCP\Util::linkTo('choretracker', 'ts/choretracker-main.tsx')); ?>"></script>
+\ No newline at end of file
++<link rel="stylesheet" href="<?php print_unescaped(\OCP\Util::linkTo('choretracker', 'ts/choretracker-main.css')); ?>">
++<script src="<?php print_unescaped(\OCP\Util::linkTo('choretracker', 'ts/choretracker-main.js')); ?>"></script>
+diff --git a/vite.config.ts b/vite.config.ts
+index 786831b..5a2228f 100644
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -4,14 +4,23 @@ import react from '@vitejs/plugin-react'
+ // https://vite.dev/config/
+ export default defineConfig({
+   plugins: [react()],
++  server: {
++    // `npm run api` serves the PHP backend; the dev server forwards /api to it.
++    proxy: {
++      '/api': {
++        target: 'http://127.0.0.1:8000',
++        changeOrigin: true,
++      },
++    },
++  },
+   build: {
+     outDir: 'ts',
+     lib: {
+       entry: 'src/main.tsx',
+       formats: ['iife'],
+       name: 'ChoreTracker',
+-      fileName: () => 'choretracker-main.tsx'
+-    }
+-  }
+-
++      fileName: () => 'choretracker-main.js',
++      cssFileName: 'choretracker-main',
++    },
++  },
+ })
+-- 
+2.43.0
+
